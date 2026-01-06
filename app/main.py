@@ -17,22 +17,6 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_allow_origins_list,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.include_router(auth_router)
-app.include_router(box_router)
-app.include_router(captaingift_router)
-app.include_router(captains_router)
-app.include_router(live_router)
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(bili_captain_listener.bootstrap())
@@ -51,6 +35,20 @@ async def lifespan(app: FastAPI):
                 pass
 
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_allow_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth_router)
+app.include_router(box_router)
+app.include_router(captaingift_router)
+app.include_router(captains_router)
+app.include_router(live_router)
 
 app.include_router(huangdou_router)
 app.include_router(music_router)

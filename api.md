@@ -233,3 +233,14 @@
 ```json
 { "code": 0, "message": "202512已上传" }
 ```
+
+## 直播监控 /live
+### GET `/live/status`（无需 Token）
+**响应**
+```json
+{
+  "status": 1,
+  "live_time": "2024-01-01 12:00:00",
+  "title": "string"
+}
+```
