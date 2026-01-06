@@ -19,6 +19,7 @@ from aiohttp import ContentTypeError
 from app.core.config import get_settings
 from app.db.session import async_session_factory
 from sqlalchemy import select
+from sqlalchemy.dialects.mysql import insert
 
 from app.models.captain import Captain
 from app.models.gift_ranking import GiftRanking
@@ -470,17 +471,26 @@ class MyHandler(blivedm.BaseHandler):
 
 async def _record_gift_ranking(uid: str, username: str, gift_count: int) -> None:
     async with async_session_factory() as session:
-        result = await session.execute(select(GiftRanking).where(GiftRanking.user_uid == uid))
-        row = result.scalar_one_or_none()
-        if row:
-            row.gift_count += gift_count
-            if username:
-                row.username = username
-        else:
-            session.add(
-                GiftRanking(user_uid=uid, username=username or None, gift_count=gift_count)
+        try:
+            stmt = insert(GiftRanking).values(
+                user_uid=uid,
+                username=username or None,
+                gift_count=gift_count,
             )
-        await session.commit()
+            update_values = {
+                "gift_count": GiftRanking.gift_count + gift_count,
+            }
+            if username:
+                update_values["username"] = username
+            stmt = stmt.on_duplicate_key_update(**update_values)
+            await session.execute(stmt)
+            await session.commit()
+        except Exception as e:
+            logger.error("[Gift] 写入 gift_ranking 失败 uid=%s: %s", uid, e)
+            try:
+                await session.rollback()
+            except Exception:
+                pass
 
 
 def live_status_snapshot() -> Dict[str, Any]:
