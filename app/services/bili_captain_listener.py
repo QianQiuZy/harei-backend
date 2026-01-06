@@ -18,7 +18,10 @@ from aiohttp import ContentTypeError
 
 from app.core.config import get_settings
 from app.db.session import async_session_factory
+from sqlalchemy import select
+
 from app.models.captain import Captain
+from app.models.gift_ranking import GiftRanking
 
 logger = logging.getLogger(__name__)
 
@@ -401,10 +404,34 @@ class MyHandler(blivedm.BaseHandler):
 
     def _on_gift(self, client: blivedm.BLiveClient, message: Any) -> None:  # noqa: N802
         try:
-            if getattr(message, "uid", 0) == 0:
+            uid = getattr(message, "uid", 0) or 0
+            if int(uid) == 0:
                 _send_cookie_invalid_email_async(f"[{client.room_id}] gift uid=0")
+                return
+
+            gift_name = getattr(message, "gift_name", "") or ""
+            if gift_name != "口水黄豆":
+                return
+
+            num = getattr(message, "num", 1) or 1
+            username = getattr(message, "uname", None) or getattr(message, "username", None) or ""
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                logger.warning("[Gift] 未找到运行中的事件循环，跳过记录 uid=%s", uid)
+                return
+
+            loop.create_task(
+                _record_gift_ranking(uid=str(uid), username=str(username), gift_count=int(num))
+            )
+            logger.info(
+                "[%s] %s 送了 %s 个口水黄豆",
+                client.room_id,
+                username,
+                num,
+            )
         except Exception as e:
-            logger.error("[Gift] uid0 告警检测异常: %s", e)
+            logger.error("[Gift] 处理礼物记录异常: %s", e)
 
     def _on_user_toast_v2(self, client: blivedm.BLiveClient, message: Any) -> None:  # noqa: N802
         try:
@@ -441,18 +468,28 @@ class MyHandler(blivedm.BaseHandler):
         except Exception as e:
             logger.error("[Captain] 处理 USER_TOAST_V2 异常: %s", e)
 
+async def _record_gift_ranking(uid: str, username: str, gift_count: int) -> None:
+    async with async_session_factory() as session:
+        result = await session.execute(select(GiftRanking).where(GiftRanking.user_uid == uid))
+        row = result.scalar_one_or_none()
+        if row:
+            row.gift_count += gift_count
+            if username:
+                row.username = username
+        else:
+            session.add(
+                GiftRanking(user_uid=uid, username=username or None, gift_count=gift_count)
+            )
+        await session.commit()
+
+
 def live_status_snapshot() -> Dict[str, Any]:
+    room_id = ROOM_IDS[0] if ROOM_IDS else 0
+    info = LIVE_INFO.get(room_id, {}) if room_id else {}
     return {
-        "enabled": bool(get_settings().bili_monitor_enabled),
-        "rooms": [
-            {
-                "room_id": rid,
-                "status": LAST_STATUS.get(rid, 0),
-                "live_time": (LIVE_INFO.get(rid, {}) or {}).get("live_time", "0000-00-00 00:00:00"),
-                "title": (LIVE_INFO.get(rid, {}) or {}).get("title", ""),
-            }
-            for rid in ROOM_IDS
-        ],
+        "status": LAST_STATUS.get(room_id, 0) if room_id else 0,
+        "live_time": info.get("live_time", "0000-00-00 00:00:00"),
+        "title": info.get("title", ""),
     }
 
 _tasks: list[asyncio.Task] = []
