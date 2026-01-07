@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from uuid import uuid4
 import socket
 
@@ -27,6 +28,57 @@ ORIGINAL_DIR = UPLOAD_ROOT / "original"
 THUMB_DIR = UPLOAD_ROOT / "thumbs"
 JPG_DIR = UPLOAD_ROOT / "jpg"
 
+RATE_LIMIT_WINDOWS = (
+    (30, 1),
+    (60 * 60, 3),
+    (60 * 60 * 24, 5),
+)
+
+RATE_LIMIT_SCRIPT = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window1 = tonumber(ARGV[2])
+local limit1 = tonumber(ARGV[3])
+local window2 = tonumber(ARGV[4])
+local limit2 = tonumber(ARGV[5])
+local window3 = tonumber(ARGV[6])
+local limit3 = tonumber(ARGV[7])
+
+local max_window = math.max(window1, window2, window3)
+redis.call("ZREMRANGEBYSCORE", key, 0, now - max_window)
+
+local function check_window(window, limit)
+    local count = redis.call("ZCOUNT", key, now - window + 1, now)
+    if tonumber(count) >= limit then
+        local oldest = redis.call("ZRANGEBYSCORE", key, now - window + 1, now, "LIMIT", 0, 1, "WITHSCORES")
+        if oldest[2] then
+            return tonumber(oldest[2]) + window
+        end
+    end
+    return nil
+end
+
+local retry_at = check_window(window1, limit1)
+if retry_at then
+    return {0, retry_at}
+end
+retry_at = check_window(window2, limit2)
+if retry_at then
+    return {0, retry_at}
+end
+retry_at = check_window(window3, limit3)
+if retry_at then
+    return {0, retry_at}
+end
+
+local seq_key = key .. ":seq"
+local seq = redis.call("INCR", seq_key)
+redis.call("ZADD", key, now, tostring(now) .. "-" .. tostring(seq))
+redis.call("EXPIRE", key, max_window + 1)
+redis.call("EXPIRE", seq_key, max_window + 1)
+return {1, 0}
+"""
+
 
 async def require_token(
     token: str = Depends(get_bearer_token),
@@ -49,6 +101,33 @@ def _resolve_upload_path(path: str, allowed_dir: Path) -> Path:
     return full_path
 
 
+async def _enforce_upload_rate_limit(redis: Redis, client_ip: str) -> None:
+    if client_ip == "0.0.0.0":
+        return
+    key = f"rate_limit:box:uploads:{client_ip}"
+    now = int(time.time())
+    result = await redis.eval(
+        RATE_LIMIT_SCRIPT,
+        numkeys=1,
+        keys=[key],
+        args=[
+            now,
+            RATE_LIMIT_WINDOWS[0][0],
+            RATE_LIMIT_WINDOWS[0][1],
+            RATE_LIMIT_WINDOWS[1][0],
+            RATE_LIMIT_WINDOWS[1][1],
+            RATE_LIMIT_WINDOWS[2][0],
+            RATE_LIMIT_WINDOWS[2][1],
+        ],
+    )
+    if isinstance(result, (list, tuple)) and result and int(result[0]) == 0:
+        retry_at = int(result[1])
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"retry_at": retry_at},
+        )
+
+
 @router.post("/uploads", response_model=UploadResponse)
 async def upload_message(
     request: Request,
@@ -56,6 +135,7 @@ async def upload_message(
     tag: str | None = Form(default=None),
     files: list[UploadFile] | None = File(default=None),
     session: AsyncSession = Depends(get_db_session),
+    redis: Redis = Depends(get_redis_client),
 ) -> UploadResponse:
     client_ip = request.headers.get("Eo-Connecting-Ip")
     if not client_ip:
@@ -64,6 +144,7 @@ async def upload_message(
             client_ip = forwarded.split(",")[0].strip()
     if not client_ip:
         client_ip = request.client.host if request.client else "0.0.0.0"
+    await _enforce_upload_rate_limit(redis, client_ip)
     ip_binary = (
         socket.inet_pton(socket.AF_INET6, client_ip)
         if ":" in client_ip
