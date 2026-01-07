@@ -209,6 +209,16 @@
 }
 ```
 
+### GET `/captains/xlsx?month=YYYYMM`（需要 Token）
+**说明**：按月份下载整理好的舰长 XLSX 文件。
+
+**响应**：XLSX 文件
+
+**失败响应**
+```json
+{ "detail": "未找到YYYYMM上舰记录" }
+```
+
 ## 舰礼 /captaingift
 ### GET `/captaingift`（无需 Token）
 **响应**

@@ -1,6 +1,10 @@
 from datetime import datetime
+from io import BytesIO
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,3 +60,56 @@ async def list_captains(
         for row in rows
     ]
     return CaptainListResponse(items=items)
+
+
+@router.get("/captains/xlsx")
+async def export_captains_xlsx(
+    month: str = Query(..., pattern=r"^\d{6}$"),
+    session: AsyncSession = Depends(get_db_session),
+    _: None = Depends(require_token),
+) -> StreamingResponse:
+    query = select(Captain).where(Captain.joined_month == month)
+    result = await session.execute(query.order_by(Captain.joined_at.asc()))
+    rows = result.scalars().all()
+
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"未找到{month}上舰记录")
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = f"{month}舰长"
+
+    headers = ["UID", "用户名", "舰长等级", "上舰数量", "上舰时间", "是否红包"]
+    worksheet.append(headers)
+
+    column_widths = [len(header) for header in headers]
+    for row in rows:
+        joined_at = row.joined_at.strftime("%Y-%m-%d %H:%M:%S")
+        values = [
+            row.user_uid,
+            row.username or "",
+            row.level,
+            row.ship_count,
+            joined_at,
+            "是" if row.is_red_packet else "否",
+        ]
+        worksheet.append(values)
+        for index, value in enumerate(values):
+            value_length = len(str(value))
+            if value_length > column_widths[index]:
+                column_widths[index] = value_length
+
+    for index, width in enumerate(column_widths, start=1):
+        worksheet.column_dimensions[get_column_letter(index)].width = width + 2
+
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+
+    filename = f"captains_{month}.xlsx"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers,
+    )
