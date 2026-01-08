@@ -39,13 +39,14 @@
 ## 留言箱 /box
 ### POST `/box/uploads`（无需 Token）
 **表单字段**
-- `message`：string，可选
-- `tag`：string，可选
+- `message`：string，必填
+- `tag`：string，必填
 - `files`：file[]，可选（支持多图）
 
 **限速**
 - 同一 IP 限速：30 秒内最多 1 次、1 小时内最多 3 次、每天最多 5 次
 - 无法获取真实客户端 IP 时（`0.0.0.0`）不限速
+- 缺少字段的请求同样计入限速
 
 **响应**
 ```json
@@ -61,6 +62,15 @@
 {
   "detail": {
     "retry_at": 1719999999
+  }
+}
+```
+
+**缺少字段响应**
+```json
+{
+  "detail": {
+    "missing_fields": ["message", "tag"]
   }
 }
 ```
