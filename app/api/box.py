@@ -108,17 +108,15 @@ async def _enforce_upload_rate_limit(redis: Redis, client_ip: str) -> None:
     now = int(time.time())
     result = await redis.eval(
         RATE_LIMIT_SCRIPT,
-        numkeys=1,
-        keys=[key],
-        args=[
-            now,
-            RATE_LIMIT_WINDOWS[0][0],
-            RATE_LIMIT_WINDOWS[0][1],
-            RATE_LIMIT_WINDOWS[1][0],
-            RATE_LIMIT_WINDOWS[1][1],
-            RATE_LIMIT_WINDOWS[2][0],
-            RATE_LIMIT_WINDOWS[2][1],
-        ],
+        1,
+        key,
+        now,
+        RATE_LIMIT_WINDOWS[0][0],
+        RATE_LIMIT_WINDOWS[0][1],
+        RATE_LIMIT_WINDOWS[1][0],
+        RATE_LIMIT_WINDOWS[1][1],
+        RATE_LIMIT_WINDOWS[2][0],
+        RATE_LIMIT_WINDOWS[2][1],
     )
     if isinstance(result, (list, tuple)) and result and int(result[0]) == 0:
         retry_at = int(result[1])
