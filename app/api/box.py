@@ -145,6 +145,16 @@ async def upload_message(
     if not client_ip:
         client_ip = request.client.host if request.client else "0.0.0.0"
     await _enforce_upload_rate_limit(redis, client_ip)
+    missing_fields: list[str] = []
+    if message is None or not message.strip():
+        missing_fields.append("message")
+    if tag is None or not tag.strip():
+        missing_fields.append("tag")
+    if missing_fields:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"missing_fields": missing_fields},
+        )
     ip_binary = (
         socket.inet_pton(socket.AF_INET6, client_ip)
         if ":" in client_ip
@@ -155,7 +165,7 @@ async def upload_message(
     THUMB_DIR.mkdir(parents=True, exist_ok=True)
     JPG_DIR.mkdir(parents=True, exist_ok=True)
 
-    message_row = Message(ip_address=ip_binary, message_text=message, tag=tag)
+    message_row = Message(ip_address=ip_binary, message_text=message.strip(), tag=tag.strip())
     session.add(message_row)
     await session.flush()
 
