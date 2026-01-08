@@ -128,6 +128,40 @@
 { "code": 0, "message": "X条消息已归档" }
 ```
 
+## 下载 /download
+### GET `/download/active`（无需 Token）
+**响应**
+```json
+{
+  "code": 0,
+  "items": [
+    {
+      "download_id": 1,
+      "description": "string",
+      "path": "https://example.com/file.zip"
+    }
+  ]
+}
+```
+
+### GET `/download/file?path=...`（无需 Token）
+**响应**：文件内容（仅支持内部路径）
+
+### POST `/download/add`（需要 Token）
+**请求体（JSON）**
+```json
+{ "description": "string", "path": "https://example.com/file.zip" }
+```
+
+**请求体（表单，上传文件）**
+- `description`：string，必填
+- `file`：file，必填
+
+**响应**
+```json
+{ "code": 0, "download_id": 1, "path": "download_files/xxx.zip" }
+```
+
 ## 音乐
 ### GET `/music`（无需 Token）
 **响应**
