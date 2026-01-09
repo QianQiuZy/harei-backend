@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Enum, Index, LargeBinary, Text, TIMESTAMP, String
+from sqlalchemy import Enum, Index, Text, TIMESTAMP, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -11,7 +11,7 @@ class Message(Base):
     __tablename__ = "messages"
 
     message_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    ip_address: Mapped[bytes] = mapped_column(LargeBinary(16), nullable=False)
+    ip_address: Mapped[str] = mapped_column(String(45), nullable=False)
     message_text: Mapped[str | None] = mapped_column(Text)
     tag: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import time
 from uuid import uuid4
-import socket
+import ipaddress
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse
@@ -153,17 +153,13 @@ async def upload_message(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"missing_fields": missing_fields},
         )
-    ip_binary = (
-        socket.inet_pton(socket.AF_INET6, client_ip)
-        if ":" in client_ip
-        else socket.inet_pton(socket.AF_INET, client_ip)
-    )
+    ip_value = str(ipaddress.ip_address(client_ip))
 
     ORIGINAL_DIR.mkdir(parents=True, exist_ok=True)
     THUMB_DIR.mkdir(parents=True, exist_ok=True)
     JPG_DIR.mkdir(parents=True, exist_ok=True)
 
-    message_row = Message(ip_address=ip_binary, message_text=message.strip(), tag=tag.strip())
+    message_row = Message(ip_address=ip_value, message_text=message.strip(), tag=tag.strip())
     session.add(message_row)
     await session.flush()
 
