@@ -174,18 +174,19 @@ async def upload_message(
             file_suffix = Path(upload.filename or "").suffix.lower() or ".bin"
             file_id = uuid4().hex
 
-            original_path = ORIGINAL_DIR / f"{file_id}{file_suffix}"
+            filename_base = f"{message_row.message_id}-{file_id}"
+            original_path = ORIGINAL_DIR / f"{filename_base}-original{file_suffix}"
             original_path.write_bytes(raw_bytes)
 
             with PilImage.open(original_path) as img:
                 rgb_image = img.convert("RGB")
 
-                jpg_path = JPG_DIR / f"{file_id}.jpg"
+                jpg_path = JPG_DIR / f"{filename_base}-jpg.jpg"
                 rgb_image.save(jpg_path, format="JPEG", quality=90, optimize=True)
 
                 thumb_image = rgb_image.copy()
                 thumb_image.thumbnail((300, 300))
-                thumb_path = THUMB_DIR / f"{file_id}.jpg"
+                thumb_path = THUMB_DIR / f"{filename_base}-thumb.jpg"
                 thumb_image.save(thumb_path, format="JPEG", quality=70, optimize=True)
 
             image_row = Image(
