@@ -15,7 +15,7 @@ class Message(Base):
     message_text: Mapped[str | None] = mapped_column(Text)
     tag: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(
-        Enum("pending", "approved", "archived", "deleted", name="messages_status"),
+        Enum("pending", "approved", "archived", "delete", name="messages_status"),
         nullable=False,
         server_default="pending",
     )
