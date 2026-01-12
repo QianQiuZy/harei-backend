@@ -270,7 +270,7 @@ async def delete_message(
     result = await session.execute(
         update(Message)
         .where(Message.message_id == payload.id)
-        .values(status="deleted")
+        .values(status="delete")
     )
     await session.commit()
     if not result.rowcount:
