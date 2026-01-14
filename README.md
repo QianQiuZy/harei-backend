@@ -7,6 +7,17 @@
 - Python 3.11+
 - MySQL 8.0+
 - Redis 6+
+- libheif
+
+## 系统依赖安装（HEIF/HEIC 解码）
+- CentOS/RHEL/OpenCloudOS
+  ```bash
+  sudo yum install -y libheif libheif-devel
+  ```
+- Debian/Ubuntu
+  ```bash
+  sudo apt-get install -y libheif1 libheif-dev
+  ```
 
 ## 安装依赖
 ```bash
