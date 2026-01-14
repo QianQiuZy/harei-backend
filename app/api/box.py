@@ -7,7 +7,8 @@ import ipaddress
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse
-from PIL import Image as PilImage
+from PIL import Image as PilImage, UnidentifiedImageError
+from pillow_heif import register_heif_opener
 from redis.asyncio import Redis
 from sqlalchemy import update, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +28,31 @@ UPLOAD_ROOT = Path("uploads")
 ORIGINAL_DIR = UPLOAD_ROOT / "original"
 THUMB_DIR = UPLOAD_ROOT / "thumbs"
 JPG_DIR = UPLOAD_ROOT / "jpg"
+
+register_heif_opener()
+
+ALLOWED_IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".gif",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".heif",
+    ".heic",
+}
+ALLOWED_IMAGE_CONTENT_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+    "image/bmp",
+    "image/tiff",
+    "image/heif",
+    "image/heic",
+}
 
 RATE_LIMIT_WINDOWS = (
     (30, 1),
@@ -168,22 +194,38 @@ async def upload_message(
         for upload in files:
             raw_bytes = await upload.read()
             file_suffix = Path(upload.filename or "").suffix.lower() or ".bin"
+            content_type = (upload.content_type or "").lower()
+            if (
+                file_suffix not in ALLOWED_IMAGE_EXTENSIONS
+                and content_type not in ALLOWED_IMAGE_CONTENT_TYPES
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={"error": "unsupported_image_format"},
+                )
             file_id = uuid4().hex
 
             filename_base = f"{message_row.message_id}-{file_id}"
             original_path = ORIGINAL_DIR / f"{filename_base}-original{file_suffix}"
             original_path.write_bytes(raw_bytes)
 
-            with PilImage.open(original_path) as img:
-                rgb_image = img.convert("RGB")
+            try:
+                with PilImage.open(original_path) as img:
+                    img.load()
+                    rgb_image = img.convert("RGB")
 
-                jpg_path = JPG_DIR / f"{filename_base}-jpg.jpg"
-                rgb_image.save(jpg_path, format="JPEG", quality=90, optimize=True)
+                    jpg_path = JPG_DIR / f"{filename_base}-jpg.jpg"
+                    rgb_image.save(jpg_path, format="JPEG", quality=90, optimize=True)
 
-                thumb_image = rgb_image.copy()
-                thumb_image.thumbnail((300, 300))
-                thumb_path = THUMB_DIR / f"{filename_base}-thumb.jpg"
-                thumb_image.save(thumb_path, format="JPEG", quality=70, optimize=True)
+                    thumb_image = rgb_image.copy()
+                    thumb_image.thumbnail((300, 300))
+                    thumb_path = THUMB_DIR / f"{filename_base}-thumb.jpg"
+                    thumb_image.save(thumb_path, format="JPEG", quality=70, optimize=True)
+            except UnidentifiedImageError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={"error": "unsupported_image_format"},
+                ) from exc
 
             image_row = Image(
                 message_id=message_row.message_id,
