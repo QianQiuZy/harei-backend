@@ -221,7 +221,8 @@ async def upload_message(
                     thumb_image.thumbnail((300, 300))
                     thumb_path = THUMB_DIR / f"{filename_base}-thumb.jpg"
                     thumb_image.save(thumb_path, format="JPEG", quality=70, optimize=True)
-            except UnidentifiedImageError as exc:
+            except (UnidentifiedImageError, OSError) as exc:
+                original_path.unlink(missing_ok=True)
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail={"error": "unsupported_image_format"},
