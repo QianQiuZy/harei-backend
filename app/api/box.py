@@ -208,25 +208,29 @@ async def upload_message(
             filename_base = f"{message_row.message_id}-{file_id}"
             original_path = ORIGINAL_DIR / f"{filename_base}-original{file_suffix}"
             original_path.write_bytes(raw_bytes)
+            is_gif = file_suffix == ".gif" or content_type == "image/gif"
+            jpg_path = original_path
+            thumb_path = original_path
 
-            try:
-                with PilImage.open(original_path) as img:
-                    img.load()
-                    rgb_image = img.convert("RGB")
+            if not is_gif:
+                try:
+                    with PilImage.open(original_path) as img:
+                        img.load()
+                        rgb_image = img.convert("RGB")
 
-                    jpg_path = JPG_DIR / f"{filename_base}-jpg.jpg"
-                    rgb_image.save(jpg_path, format="JPEG", quality=90, optimize=True)
+                        jpg_path = JPG_DIR / f"{filename_base}-jpg.jpg"
+                        rgb_image.save(jpg_path, format="JPEG", quality=90, optimize=True)
 
-                    thumb_image = rgb_image.copy()
-                    thumb_image.thumbnail((300, 300))
-                    thumb_path = THUMB_DIR / f"{filename_base}-thumb.jpg"
-                    thumb_image.save(thumb_path, format="JPEG", quality=70, optimize=True)
-            except (UnidentifiedImageError, OSError) as exc:
-                original_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail={"error": "unsupported_image_format"},
-                ) from exc
+                        thumb_image = rgb_image.copy()
+                        thumb_image.thumbnail((300, 300))
+                        thumb_path = THUMB_DIR / f"{filename_base}-thumb.jpg"
+                        thumb_image.save(thumb_path, format="JPEG", quality=70, optimize=True)
+                except (UnidentifiedImageError, OSError) as exc:
+                    original_path.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail={"error": "unsupported_image_format"},
+                    ) from exc
 
             image_row = Image(
                 message_id=message_row.message_id,
