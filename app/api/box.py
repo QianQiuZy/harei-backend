@@ -254,13 +254,23 @@ async def download_original(path: str, _: None = Depends(require_token)) -> File
 
 @router.get("/image/thumb")
 async def download_thumbnail(path: str, _: None = Depends(require_token)) -> FileResponse:
-    file_path = _resolve_upload_path(path, THUMB_DIR)
+    try:
+        file_path = _resolve_upload_path(path, THUMB_DIR)
+    except HTTPException:
+        if Path(path).suffix.lower() != ".gif":
+            raise
+        file_path = _resolve_upload_path(path, ORIGINAL_DIR)
     return FileResponse(file_path)
 
 
 @router.get("/image/jpg")
 async def download_jpg(path: str, _: None = Depends(require_token)) -> FileResponse:
-    file_path = _resolve_upload_path(path, JPG_DIR)
+    try:
+        file_path = _resolve_upload_path(path, JPG_DIR)
+    except HTTPException:
+        if Path(path).suffix.lower() != ".gif":
+            raise
+        file_path = _resolve_upload_path(path, ORIGINAL_DIR)
     return FileResponse(file_path)
 
 
