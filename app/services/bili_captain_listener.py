@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import datetime
 import http.cookies
 import logging
-import os
 import random
 import smtplib
 import threading
 from dataclasses import dataclass
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 import aiohttp
 import blivedm
 from aiohttp import ContentTypeError
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 
 from app.core.config import get_settings
 from app.db.session import async_session_factory
@@ -84,6 +89,7 @@ def _send_cookie_invalid_email_async(log_line: str) -> None:
 
     threading.Thread(target=_worker, daemon=True).start()
 
+
 def _now() -> datetime.datetime:
     return datetime.datetime.now()
 
@@ -91,6 +97,17 @@ def _now() -> datetime.datetime:
 def month_str(dt: Optional[datetime.datetime] = None) -> str:
     dt = dt or _now()
     return dt.strftime("%Y%m")
+
+
+def _next_month_end_minute(now: datetime.datetime) -> datetime.datetime:
+    last_day = calendar.monthrange(now.year, now.month)[1]
+    target = now.replace(day=last_day, hour=23, minute=59, second=0, microsecond=0)
+    if now < target:
+        return target
+    year = now.year + (1 if now.month == 12 else 0)
+    month = 1 if now.month == 12 else now.month + 1
+    last_day = calendar.monthrange(year, month)[1]
+    return datetime.datetime(year=year, month=month, day=last_day, hour=23, minute=59, second=0)
 
 
 def _parse_room_ids_from_env(raw: str) -> list[int]:
@@ -104,6 +121,7 @@ def _parse_room_ids_from_env(raw: str) -> list[int]:
         except ValueError:
             continue
     return out
+
 
 def init_session() -> None:
     settings = get_settings()
@@ -148,6 +166,11 @@ USER_AGENT = (
 
 LIVE_STATUS_API = "https://api.live.bilibili.com/room/v1/Room/get_status_info_by_uids"
 ROOM_INFO_API = "https://api.live.bilibili.com/room/v1/Room/get_info"
+GUARD_LIST_API = "https://api.live.bilibili.com/xlive/app-room/v2/guardTab/topListNew"
+GUARD_REPORT_RECEIVER = "harei0301@163.com"
+GUARD_REPORT_ROOT = Path("download_files")
+GUARD_REPORT_RUID = 1048135385
+GUARD_REPORT_ROOM_ID = 1820703922
 
 
 async def _fetch_room_uid(room_id: int) -> Optional[int]:
@@ -312,6 +335,162 @@ def _level_name(guard_level: Any) -> Optional[str]:
     if gl == 1:
         return "总督"
     return None
+
+
+async def _fetch_guard_page(page: int) -> list[dict[str, Any]]:
+    if aiohttp_session is None:
+        logger.error("[Guard] aiohttp_session 未初始化，无法拉取在舰列表")
+        return []
+
+    params = {
+        "ruid": GUARD_REPORT_RUID,
+        "roomid": GUARD_REPORT_ROOM_ID,
+        "page": page,
+        "page_size": 30,
+        "typ": 5,
+    }
+    try:
+        async with aiohttp_session.get(
+            GUARD_LIST_API,
+            params=params,
+            timeout=10,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Referer": f"https://live.bilibili.com/{GUARD_REPORT_ROOM_ID}",
+            },
+        ) as resp:
+            if resp.status != 200:
+                logger.warning("[Guard] page=%s HTTP %s", page, resp.status)
+                return []
+            try:
+                payload = await resp.json(content_type=None)
+            except ContentTypeError:
+                text = (await resp.text())[:200]
+                logger.warning("[Guard] page=%s 非 JSON，前 200 字：%s", page, text)
+                return []
+    except Exception as e:
+        logger.error("[Guard] page=%s 请求异常: %s", page, e)
+        return []
+
+    data = payload.get("data") or {}
+    raw_list = data.get("list") or []
+    if not isinstance(raw_list, list):
+        return []
+    return raw_list
+
+
+def _normalize_guard_rows(raw_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in raw_list:
+        uinfo = item.get("uinfo") or {}
+        base = uinfo.get("base") or {}
+        guard = uinfo.get("guard") or {}
+        uid = uinfo.get("uid") or base.get("uid") or ""
+        name = base.get("name") or ""
+        level = _level_name(guard.get("level")) or ""
+        rows.append({"uid": uid, "name": name, "level": level})
+    return rows
+
+
+async def _collect_guard_rows() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        raw_list = await _fetch_guard_page(page)
+        if not raw_list:
+            break
+        rows.extend(_normalize_guard_rows(raw_list))
+        page += 1
+        await asyncio.sleep(0.8)
+    return rows
+
+
+def _build_guard_report_xlsx(rows: list[dict[str, Any]], month: str) -> Path:
+    GUARD_REPORT_ROOT.mkdir(parents=True, exist_ok=True)
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = f"{month}在舰列表"
+
+    headers = ["UID", "用户名", "舰长等级"]
+    worksheet.append(headers)
+
+    column_widths = [len(header) for header in headers]
+    for row in rows:
+        values = [row.get("uid", ""), row.get("name", ""), row.get("level", "")]
+        worksheet.append(values)
+        for index, value in enumerate(values):
+            value_length = len(str(value))
+            if value_length > column_widths[index]:
+                column_widths[index] = value_length
+
+    for index, width in enumerate(column_widths, start=1):
+        worksheet.column_dimensions[get_column_letter(index)].width = width + 2
+
+    filename = f"{month}在舰列表.xlsx"
+    file_path = GUARD_REPORT_ROOT / filename
+    workbook.save(file_path)
+    return file_path
+
+
+def _send_guard_report_email(file_path: Path, month: str, total: int) -> None:
+    settings = get_settings()
+    if not (settings.smtp_host and settings.email_from):
+        logger.warning("[SMTP] 未配置 SMTP_HOST/EMAIL_FROM，跳过在舰列表邮件")
+        return
+
+    subject = f"{month}在舰列表（自动发送）"
+    body = f"{month} 在舰列表已生成，共 {total} 人。"
+
+    msg = MIMEMultipart()
+    msg["Subject"] = subject
+    msg["From"] = settings.email_from
+    msg["To"] = GUARD_REPORT_RECEIVER
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    with file_path.open("rb") as f:
+        attachment = MIMEApplication(
+            f.read(),
+            _subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    attachment.add_header("Content-Disposition", "attachment", filename=file_path.name)
+    msg.attach(attachment)
+
+    if int(settings.smtp_port) == 465:
+        with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port) as server:
+            if settings.smtp_user and settings.smtp_pass:
+                server.login(settings.smtp_user, settings.smtp_pass)
+            server.sendmail(settings.email_from, [GUARD_REPORT_RECEIVER], msg.as_string())
+    else:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as server:
+            server.starttls()
+            if settings.smtp_user and settings.smtp_pass:
+                server.login(settings.smtp_user, settings.smtp_pass)
+            server.sendmail(settings.email_from, [GUARD_REPORT_RECEIVER], msg.as_string())
+
+
+async def _run_guard_report(target_time: datetime.datetime) -> None:
+    month = target_time.strftime("%Y%m")
+    logger.info("[Guard] 开始拉取 %s 在舰列表", month)
+    rows = await _collect_guard_rows()
+    file_path = _build_guard_report_xlsx(rows, month)
+    await asyncio.to_thread(_send_guard_report_email, file_path, month, len(rows))
+    logger.info("[Guard] 在舰列表已发送 month=%s count=%s path=%s", month, len(rows), file_path)
+
+
+async def guard_report_scheduler() -> None:
+    while True:
+        now = _now()
+        target = _next_month_end_minute(now)
+        sleep_sec = max(1.0, (target - now).total_seconds())
+        logger.info("[Guard] 距离下一次在舰列表任务还有约 %.1f 分钟", sleep_sec / 60.0)
+        await asyncio.sleep(sleep_sec)
+
+        try:
+            await _run_guard_report(target)
+        except asyncio.CancelledError:
+            logger.debug("[Guard] 在舰列表任务 Cancelled（预期）")
+        except Exception as e:
+            logger.error("[Guard] 在舰列表任务失败: %s", e)
 
 
 async def captain_writer_worker() -> None:
@@ -525,6 +704,7 @@ async def bootstrap() -> None:
             loop.create_task(run_clients_loop(), name="bili:clients"),
             loop.create_task(monitor_all_rooms_status(), name="bili:live_status"),
             loop.create_task(reconnect_scheduler(), name="bili:reconnect"),
+            loop.create_task(guard_report_scheduler(), name="bili:guard_report"),
         ]
     )
     logger.info("[bili] 后台监听已启动，tasks=%d", len(_tasks))
