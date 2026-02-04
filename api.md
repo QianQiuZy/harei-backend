@@ -143,8 +143,9 @@
   ]
 }
 ```
+> 说明：`path` 仅返回外部可访问链接，内部文件会返回 `/download/file?download_id=...` 形式的链接。
 
-### GET `/download/file?path=...`（无需 Token）
+### GET `/download/file?download_id=...`（无需 Token）
 **响应**：文件内容（仅支持内部路径）
 
 ### POST `/download/add`（需要 Token）

@@ -47,25 +47,36 @@ def _resolve_download_path(path: str) -> Path:
 
 
 @router.get("/active", response_model=DownloadListResponse)
-async def list_active(session: AsyncSession = Depends(get_db_session)) -> DownloadListResponse:
+async def list_active(
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+) -> DownloadListResponse:
     result = await session.execute(select(Download).order_by(Download.download_id.desc()))
     rows = result.scalars().all()
     items = [
         {
             "download_id": row.download_id,
             "description": row.description,
-            "path": row.path,
+            "path": row.path
+            if _is_external_path(row.path)
+            else f"{request.url_for('download_file')}?download_id={row.download_id}",
         }
         for row in rows
     ]
     return DownloadListResponse(items=items)
 
 
-@router.get("/file")
-async def download_file(path: str) -> FileResponse:
-    if _is_external_path(path):
+@router.get("/file", name="download_file")
+async def download_file(
+    download_id: int,
+    session: AsyncSession = Depends(get_db_session),
+) -> FileResponse:
+    row = await session.get(Download, download_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    if _is_external_path(row.path):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="External path not allowed")
-    file_path = _resolve_download_path(path)
+    file_path = _resolve_download_path(row.path)
     return FileResponse(file_path)
 
 
