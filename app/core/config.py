@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     smtp_pass: str = ""
     email_from: str = ""
     email_to: str = ""
+    email_cc: str = ""
 
     token_ttl_seconds: int = 60 * 60 * 24 * 7
 
@@ -50,6 +51,10 @@ class Settings(BaseSettings):
     @property
     def cors_allow_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_allow_origins.split(",") if origin.strip()]
+
+    @property
+    def email_cc_list(self) -> list[str]:
+        return [email.strip() for email in self.email_cc.split(",") if email.strip()]
 
 
 @lru_cache

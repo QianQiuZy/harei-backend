@@ -32,6 +32,8 @@ cp env.example .env
 ```
 按需修改 `.env` 中的数据库、Redis 与认证配置。
 
+如需月底在舰列表邮件增加抄送，可配置 `EMAIL_CC`（多个邮箱使用英文逗号分隔）。
+
 ## 运行服务（Uvicorn）
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000
