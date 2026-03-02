@@ -438,6 +438,8 @@ def _send_guard_report_email(file_path: Path, month: str, total: int) -> None:
         logger.warning("[SMTP] 未配置 SMTP_HOST/EMAIL_FROM，跳过在舰列表邮件")
         return
 
+    cc_list = settings.email_cc_list
+
     subject = f"{month}在舰列表（自动发送）"
     body = f"{month} 在舰列表已生成，共 {total} 人。"
 
@@ -445,6 +447,8 @@ def _send_guard_report_email(file_path: Path, month: str, total: int) -> None:
     msg["Subject"] = subject
     msg["From"] = settings.email_from
     msg["To"] = GUARD_REPORT_RECEIVER
+    if cc_list:
+        msg["Cc"] = ",".join(cc_list)
     msg.attach(MIMEText(body, "plain", "utf-8"))
 
     with file_path.open("rb") as f:
@@ -455,17 +459,19 @@ def _send_guard_report_email(file_path: Path, month: str, total: int) -> None:
     attachment.add_header("Content-Disposition", "attachment", filename=file_path.name)
     msg.attach(attachment)
 
+    receivers = [GUARD_REPORT_RECEIVER, *cc_list]
+
     if int(settings.smtp_port) == 465:
         with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port) as server:
             if settings.smtp_user and settings.smtp_pass:
                 server.login(settings.smtp_user, settings.smtp_pass)
-            server.sendmail(settings.email_from, [GUARD_REPORT_RECEIVER], msg.as_string())
+            server.sendmail(settings.email_from, receivers, msg.as_string())
     else:
         with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as server:
             server.starttls()
             if settings.smtp_user and settings.smtp_pass:
                 server.login(settings.smtp_user, settings.smtp_pass)
-            server.sendmail(settings.email_from, [GUARD_REPORT_RECEIVER], msg.as_string())
+            server.sendmail(settings.email_from, receivers, msg.as_string())
 
 
 async def _run_guard_report(target_time: datetime.datetime) -> None:
