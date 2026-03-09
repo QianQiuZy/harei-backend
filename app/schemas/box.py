@@ -13,6 +13,10 @@ class DeleteRequest(BaseModel):
     id: int
 
 
+class TagFilterRequest(BaseModel):
+    tag: str | None = None
+
+
 class MessageItem(BaseModel):
     id: int
     created_at: datetime

@@ -107,6 +107,12 @@
 响应结构同 `/box/pending`。
 
 ### POST `/box/approve`（需要 Token）
+**请求体（可选）**
+```json
+{ "tag": "string" }
+```
+> 说明：不传请求体（或不传 `tag`）时，保持原行为（全量过审 `pending`）；传 `tag` 时仅过审该标签下 `pending` 消息。
+
 **响应**
 ```json
 { "code": 0, "message": "X条消息已过审" }
@@ -123,6 +129,12 @@
 ```
 
 ### POST `/box/archived`（需要 Token）
+**请求体（可选）**
+```json
+{ "tag": "string" }
+```
+> 说明：不传请求体（或不传 `tag`）时，保持原行为（全量归档 `approved`）；传 `tag` 时仅归档该标签下 `approved` 消息。
+
 **响应**
 ```json
 { "code": 0, "message": "X条消息已归档" }

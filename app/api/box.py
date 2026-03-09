@@ -19,7 +19,7 @@ from app.db.session import get_db_session
 from app.deps.auth import get_bearer_token
 from app.models.image import Image
 from app.models.message import Message
-from app.schemas.box import DeleteRequest, MessageListResponse, UploadResponse
+from app.schemas.box import DeleteRequest, MessageListResponse, TagFilterRequest, UploadResponse
 from app.services.auth_service import AuthService
 
 router = APIRouter(prefix="/box")
@@ -306,15 +306,17 @@ async def list_approved(
 
 @router.post("/approve")
 async def approve_all(
+    payload: TagFilterRequest | None = None,
     session: AsyncSession = Depends(get_db_session),
     _: None = Depends(require_token),
 ) -> dict:
-    result = await session.execute(
-        update(Message)
-        .where(Message.status == "pending")
-        .values(status="approved")
-    )
+    stmt = update(Message).where(Message.status == "pending")
+    if payload and payload.tag:
+        stmt = stmt.where(Message.tag == payload.tag)
+    result = await session.execute(stmt.values(status="approved"))
     await session.commit()
+    if payload and payload.tag:
+        return {"code": 0, "message": f"标签{payload.tag}下{result.rowcount or 0}条消息已过审"}
     return {"code": 0, "message": f"{result.rowcount or 0}条消息已过审"}
 
 
@@ -337,13 +339,15 @@ async def delete_message(
 
 @router.post("/archived")
 async def archived_all(
+    payload: TagFilterRequest | None = None,
     session: AsyncSession = Depends(get_db_session),
     _: None = Depends(require_token),
 ) -> dict:
-    result = await session.execute(
-        update(Message)
-        .where(Message.status == "approved")
-        .values(status="archived")
-    )
+    stmt = update(Message).where(Message.status == "approved")
+    if payload and payload.tag:
+        stmt = stmt.where(Message.tag == payload.tag)
+    result = await session.execute(stmt.values(status="archived"))
     await session.commit()
+    if payload and payload.tag:
+        return {"code": 0, "message": f"标签{payload.tag}下{result.rowcount or 0}条消息已归档"}
     return {"code": 0, "message": f"{result.rowcount or 0}条消息已归档"}
