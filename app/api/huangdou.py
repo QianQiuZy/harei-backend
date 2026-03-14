@@ -12,12 +12,14 @@ router = APIRouter(prefix="/huangdou")
 @router.get("/rank", response_model=GiftRankingListResponse)
 async def list_rank(session: AsyncSession = Depends(get_db_session)) -> GiftRankingListResponse:
     result = await session.execute(
-        select(GiftRanking).order_by(desc(GiftRanking.gift_count)).limit(20)
+        select(GiftRanking.user_uid, GiftRanking.username, GiftRanking.gift_count)
+        .order_by(desc(GiftRanking.gift_count))
+        .limit(20)
     )
-    rows = result.scalars().all()
+    rows = result.all()
     items = [
-        GiftRankingItem(uid=row.user_uid, name=row.username, count=row.gift_count)
-        for row in rows
+        GiftRankingItem(uid=user_uid, name=username, count=gift_count)
+        for user_uid, username, gift_count in rows
     ]
     return GiftRankingListResponse(items=items)
 
@@ -27,8 +29,13 @@ async def get_by_uid(
     uid: str = Query(...),
     session: AsyncSession = Depends(get_db_session),
 ) -> GiftRankingResponse:
-    result = await session.execute(select(GiftRanking).where(GiftRanking.user_uid == uid))
-    row = result.scalar_one_or_none()
+    result = await session.execute(
+        select(GiftRanking.user_uid, GiftRanking.username, GiftRanking.gift_count).where(
+            GiftRanking.user_uid == uid
+        )
+    )
+    row = result.one_or_none()
     if not row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-    return GiftRankingResponse(uid=row.user_uid, name=row.username, count=row.gift_count, code=0)
+    user_uid, username, gift_count = row
+    return GiftRankingResponse(uid=user_uid, name=username, count=gift_count, code=0)
