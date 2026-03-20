@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import asyncio
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
-from PIL import Image as PilImage
+from PIL import Image as PilImage, UnidentifiedImageError
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +30,24 @@ async def require_token(
     username = await service.get_username_by_token(token)
     if not username:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+
+def _process_captaingift_image(raw_bytes: bytes, target_path: Path) -> None:
+    temp_path = target_path.with_suffix(".upload")
+
+    try:
+        temp_path.write_bytes(raw_bytes)
+        with PilImage.open(temp_path) as img:
+            rgb_image = img.convert("RGB")
+            rgb_image.save(target_path, format="JPEG", quality=90, optimize=True)
+    except (UnidentifiedImageError, OSError) as exc:
+        target_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid image",
+        ) from exc
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def _resolve_gift_path(path: str) -> Path:
@@ -83,13 +102,7 @@ async def upload_captaingift(
     target_path = CAPTAIN_GIFT_DIR / filename
 
     raw_bytes = await file.read()
-    temp_path = target_path.with_suffix(".upload")
-    temp_path.write_bytes(raw_bytes)
-
-    with PilImage.open(temp_path) as img:
-        rgb_image = img.convert("RGB")
-        rgb_image.save(target_path, format="JPEG", quality=90, optimize=True)
-    temp_path.unlink(missing_ok=True)
+    await asyncio.to_thread(_process_captaingift_image, raw_bytes, target_path)
 
     result = await session.execute(
         select(CaptainGiftArchive).where(CaptainGiftArchive.gift_month == month)
