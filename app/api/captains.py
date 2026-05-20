@@ -3,8 +3,6 @@ from io import BytesIO
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
-from openpyxl import Workbook
-from openpyxl.utils import get_column_letter
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +13,7 @@ from app.deps.auth import get_bearer_token
 from app.models.captain import Captain
 from app.schemas.captains import CaptainItem, CaptainListResponse
 from app.services.auth_service import AuthService
+from app.services.captain_reports import build_captains_workbook
 
 router = APIRouter()
 
@@ -75,33 +74,7 @@ async def export_captains_xlsx(
     if not rows:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"未找到{month}上舰记录")
 
-    workbook = Workbook()
-    worksheet = workbook.active
-    worksheet.title = f"{month}舰长"
-
-    headers = ["UID", "用户名", "舰长等级", "上舰数量", "上舰时间", "是否红包"]
-    worksheet.append(headers)
-
-    column_widths = [len(header) for header in headers]
-    for row in rows:
-        joined_at = row.joined_at.strftime("%Y-%m-%d %H:%M:%S")
-        values = [
-            row.user_uid,
-            row.username or "",
-            row.level,
-            row.ship_count,
-            joined_at,
-            "是" if row.is_red_packet else "否",
-        ]
-        worksheet.append(values)
-        for index, value in enumerate(values):
-            value_length = len(str(value))
-            if value_length > column_widths[index]:
-                column_widths[index] = value_length
-
-    for index, width in enumerate(column_widths, start=1):
-        worksheet.column_dimensions[get_column_letter(index)].width = width + 2
-
+    workbook = build_captains_workbook(rows, month)
     output = BytesIO()
     workbook.save(output)
     output.seek(0)

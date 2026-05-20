@@ -28,6 +28,7 @@ from sqlalchemy.dialects.mysql import insert
 
 from app.models.captain import Captain
 from app.models.gift_ranking import GiftRanking
+from app.services.captain_reports import save_captains_xlsx
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ ROOM_UIDS: Dict[int, int] = {}
 
 LAST_STATUS: Dict[int, int] = {}
 LIVE_INFO: Dict[int, Dict[str, str]] = {}
+GUARD_SNAPSHOT_COUNTS: Dict[str, int] = {}
 
 COOKIE_ALERT_SENT = False
 
@@ -99,15 +101,30 @@ def month_str(dt: Optional[datetime.datetime] = None) -> str:
     return dt.strftime("%Y%m")
 
 
-def _next_month_end_minute(now: datetime.datetime) -> datetime.datetime:
+def _next_month_report_time(now: datetime.datetime) -> datetime.datetime:
+    target = datetime.datetime(year=now.year, month=now.month, day=1, hour=0, minute=1, second=0)
+    if now <= target:
+        return target
+    year = now.year + (1 if now.month == 12 else 0)
+    month = 1 if now.month == 12 else now.month + 1
+    return datetime.datetime(year=year, month=month, day=1, hour=0, minute=1, second=0)
+
+
+def _next_guard_snapshot_time(now: datetime.datetime) -> datetime.datetime:
     last_day = calendar.monthrange(now.year, now.month)[1]
-    target = now.replace(day=last_day, hour=23, minute=59, second=0, microsecond=0)
-    if now < target:
+    target = datetime.datetime(year=now.year, month=now.month, day=last_day, hour=23, minute=59, second=0)
+    if now <= target:
         return target
     year = now.year + (1 if now.month == 12 else 0)
     month = 1 if now.month == 12 else now.month + 1
     last_day = calendar.monthrange(year, month)[1]
     return datetime.datetime(year=year, month=month, day=last_day, hour=23, minute=59, second=0)
+
+
+def _report_month_for_target(target_time: datetime.datetime) -> str:
+    if target_time.month == 1:
+        return f"{target_time.year - 1}12"
+    return f"{target_time.year}{target_time.month - 1:02d}"
 
 
 def _parse_room_ids_from_env(raw: str) -> list[int]:
@@ -409,6 +426,7 @@ def _build_guard_report_xlsx(rows: list[dict[str, Any]], month: str) -> Path:
     GUARD_REPORT_ROOT.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
     worksheet = workbook.active
+    assert worksheet is not None
     worksheet.title = f"{month}在舰列表"
 
     headers = ["UID", "用户名", "舰长等级"]
@@ -432,16 +450,55 @@ def _build_guard_report_xlsx(rows: list[dict[str, Any]], month: str) -> Path:
     return file_path
 
 
-def _send_guard_report_email(file_path: Path, month: str, total: int) -> None:
+async def _collect_monthly_captain_rows(month: str) -> list[Captain]:
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(Captain).where(Captain.joined_month == month).order_by(Captain.joined_at.asc())
+        )
+        return list(result.scalars().all())
+
+
+async def _snapshot_guard_report(target_time: datetime.datetime) -> Path:
+    month = target_time.strftime("%Y%m")
+    logger.info("[Guard] 开始拉取 %s 在舰列表快照", month)
+    guard_rows = await _collect_guard_rows()
+    GUARD_SNAPSHOT_COUNTS[month] = len(guard_rows)
+    guard_file_path = _build_guard_report_xlsx(guard_rows, month)
+    logger.info("[Guard] 在舰列表快照已生成 month=%s count=%s path=%s", month, len(guard_rows), guard_file_path)
+    return guard_file_path
+
+
+def _guard_snapshot_path(month: str) -> Path:
+    return GUARD_REPORT_ROOT / f"{month}在舰列表.xlsx"
+
+
+def _guard_snapshot_target_for_month(month: str) -> datetime.datetime:
+    year = int(month[:4])
+    month_num = int(month[4:6])
+    last_day = calendar.monthrange(year, month_num)[1]
+    return datetime.datetime(year=year, month=month_num, day=last_day, hour=23, minute=59, second=0)
+
+
+def _send_guard_report_email(
+    guard_file_path: Path,
+    captain_file_path: Path,
+    month: str,
+    guard_total: int,
+    captain_total: int,
+) -> None:
     settings = get_settings()
     if not (settings.smtp_host and settings.email_from):
-        logger.warning("[SMTP] 未配置 SMTP_HOST/EMAIL_FROM，跳过在舰列表邮件")
+        logger.warning("[SMTP] 未配置 SMTP_HOST/EMAIL_FROM，跳过月度舰长邮件")
         return
 
     cc_list = settings.email_cc_list
 
-    subject = f"{month}在舰列表（自动发送）"
-    body = f"{month} 在舰列表已生成，共 {total} 人。"
+    subject = f"{month}在舰列表与上舰情况（自动发送）"
+    body = (
+        f"{month} 在舰列表与上舰情况已生成。\n"
+        f"在舰列表人数：{guard_total} 人\n"
+        f"上舰记录数量：{captain_total} 条"
+    )
 
     msg = MIMEMultipart()
     msg["Subject"] = subject
@@ -451,13 +508,14 @@ def _send_guard_report_email(file_path: Path, month: str, total: int) -> None:
         msg["Cc"] = ",".join(cc_list)
     msg.attach(MIMEText(body, "plain", "utf-8"))
 
-    with file_path.open("rb") as f:
-        attachment = MIMEApplication(
-            f.read(),
-            _subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    attachment.add_header("Content-Disposition", "attachment", filename=file_path.name)
-    msg.attach(attachment)
+    for file_path in (guard_file_path, captain_file_path):
+        with file_path.open("rb") as f:
+            attachment = MIMEApplication(
+                f.read(),
+                _subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        attachment.add_header("Content-Disposition", "attachment", filename=file_path.name)
+        msg.attach(attachment)
 
     receivers = [GUARD_REPORT_RECEIVER, *cc_list]
 
@@ -475,24 +533,49 @@ def _send_guard_report_email(file_path: Path, month: str, total: int) -> None:
 
 
 async def _run_guard_report(target_time: datetime.datetime) -> None:
-    month = target_time.strftime("%Y%m")
-    logger.info("[Guard] 开始拉取 %s 在舰列表", month)
-    rows = await _collect_guard_rows()
-    file_path = _build_guard_report_xlsx(rows, month)
-    await asyncio.to_thread(_send_guard_report_email, file_path, month, len(rows))
-    logger.info("[Guard] 在舰列表已发送 month=%s count=%s path=%s", month, len(rows), file_path)
+    await CAPTAIN_QUEUE.join()
+    month = _report_month_for_target(target_time)
+    logger.info("[Guard] 开始生成 %s 月度舰长邮件", month)
+    guard_file_path = _guard_snapshot_path(month)
+    if not guard_file_path.exists():
+        logger.warning("[Guard] 未找到 %s 在舰列表快照，补拉一次当前在舰列表", month)
+        guard_file_path = await _snapshot_guard_report(_guard_snapshot_target_for_month(month))
+    captain_rows = await _collect_monthly_captain_rows(month)
+    captain_file_path = save_captains_xlsx(captain_rows, month, GUARD_REPORT_ROOT)
+    guard_total = GUARD_SNAPSHOT_COUNTS.get(month, -1)
+    await asyncio.to_thread(
+        _send_guard_report_email,
+        guard_file_path,
+        captain_file_path,
+        month,
+        guard_total,
+        len(captain_rows),
+    )
+    logger.info(
+        "[Guard] 月度舰长邮件已发送 month=%s guard_count=%s captain_count=%s guard_path=%s captain_path=%s",
+        month,
+        guard_total,
+        len(captain_rows),
+        guard_file_path,
+        captain_file_path,
+    )
 
 
 async def guard_report_scheduler() -> None:
     while True:
         now = _now()
-        target = _next_month_end_minute(now)
+        snapshot_target = _next_guard_snapshot_time(now)
+        report_target = _next_month_report_time(now)
+        target = snapshot_target if snapshot_target <= report_target else report_target
         sleep_sec = max(1.0, (target - now).total_seconds())
-        logger.info("[Guard] 距离下一次在舰列表任务还有约 %.1f 分钟", sleep_sec / 60.0)
+        logger.info("[Guard] 距离下一次月度舰长任务还有约 %.1f 分钟", sleep_sec / 60.0)
         await asyncio.sleep(sleep_sec)
 
         try:
-            await _run_guard_report(target)
+            if target == snapshot_target:
+                await _snapshot_guard_report(target)
+            else:
+                await _run_guard_report(target)
         except asyncio.CancelledError:
             logger.debug("[Guard] 在舰列表任务 Cancelled（预期）")
         except Exception as e:
