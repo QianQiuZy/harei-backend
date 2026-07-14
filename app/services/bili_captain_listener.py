@@ -418,7 +418,7 @@ async def _collect_guard_rows() -> list[dict[str, Any]]:
             break
         rows.extend(_normalize_guard_rows(raw_list))
         page += 1
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(0.5)
     return rows
 
 
