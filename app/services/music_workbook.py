@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from io import BytesIO
-from typing import Final, Protocol
+from typing import Final, Protocol, TypeAlias
 from urllib.parse import urlsplit
 from zipfile import BadZipFile
 
@@ -18,7 +18,7 @@ from app.models.music import Song
 IMPORT_SHEET: Final = "导入数据"
 SONG_LIST_SHEET: Final = "歌曲列表"
 IMPORT_HEADERS: Final = ("歌名", "日期", "直播标题", "歌切链接")
-type ExcelValue = (
+ExcelValue: TypeAlias = (
     bool
     | int
     | float

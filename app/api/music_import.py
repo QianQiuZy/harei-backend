@@ -111,6 +111,6 @@ async def import_performances(
 
 def _validation_error(issues: list[WorkbookIssue]) -> HTTPException:
     return HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         detail={"error": "invalid_workbook", "errors": [issue.as_dict() for issue in issues]},
     )

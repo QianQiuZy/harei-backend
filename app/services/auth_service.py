@@ -39,10 +39,10 @@ class AuthService:
         issued_at = datetime.now(UTC)
         expires_at = issued_at + timedelta(seconds=ttl)
         principal = SessionPrincipal(version=1, subject=username, scopes=scopes, issued_at=issued_at, expires_at=expires_at)
-        await self.redis.setex(
+        await self.redis.set(
             self._token_key(token),
-            ttl,
             principal.model_dump_json(),
+            ex=ttl,
         )
         return token, principal
 

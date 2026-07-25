@@ -158,7 +158,7 @@ def process_uploaded_image(
             if image.width * image.height > MAX_DECODED_IMAGE_PIXELS:
                 original_path.unlink(missing_ok=True)
                 raise HTTPException(
-                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                     detail={
                         "error": "image_too_large",
                         "max_pixels": MAX_DECODED_IMAGE_PIXELS,
@@ -184,7 +184,7 @@ def process_uploaded_image(
         for path in generated_paths:
             path.unlink(missing_ok=True)
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail={
                 "error": "image_too_large",
                 "max_pixels": MAX_DECODED_IMAGE_PIXELS,
@@ -258,7 +258,7 @@ async def upload_message(
         )
     if files and len(files) > MAX_UPLOAD_FILES:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail={"error": "too_many_files", "max_files": MAX_UPLOAD_FILES},
         )
     prepared_files: list[tuple[bytes, str, str]] = []
@@ -276,7 +276,7 @@ async def upload_message(
         raw_bytes = await upload.read(MAX_UPLOAD_BYTES + 1)
         if len(raw_bytes) > MAX_UPLOAD_BYTES:
             raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 detail={"error": "file_too_large", "max_bytes": MAX_UPLOAD_BYTES},
             )
         prepared_files.append((raw_bytes, file_suffix, content_type))
