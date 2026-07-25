@@ -206,3 +206,34 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project tooling
+.omo/
+.basedpyright/
+.pyright/
+.vscode/
+.idea/
+
+# Local environment overrides
+.env.*
+
+# Runtime uploads (keep directory placeholders)
+uploads/*
+!uploads/captaingift/
+!uploads/jpg/
+!uploads/original/
+!uploads/thumbs/
+uploads/captaingift/*
+uploads/jpg/*
+uploads/original/*
+uploads/thumbs/*
+!uploads/captaingift/.keep
+!uploads/jpg/.keep
+!uploads/original/.keep
+!uploads/thumbs/.keep
+download_files/*
+!download_files/.gitkeep
+
+# Operating systems
+.DS_Store
+Thumbs.db

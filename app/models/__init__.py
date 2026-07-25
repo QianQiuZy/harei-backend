@@ -4,7 +4,7 @@ from app.models.gift_ranking import GiftRanking
 from app.models.download import Download
 from app.models.image import Image
 from app.models.message import Message
-from app.models.music import Music
+from app.models.music import MusicAuditEvent, MusicCatalogRevision, Song, SongPerformance
 from app.models.tag import Tag
 
 __all__ = [
@@ -14,6 +14,9 @@ __all__ = [
     "GiftRanking",
     "Image",
     "Message",
-    "Music",
+    "MusicAuditEvent",
+    "MusicCatalogRevision",
+    "Song",
+    "SongPerformance",
     "Tag",
 ]

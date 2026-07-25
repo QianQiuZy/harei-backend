@@ -1,5 +1,4 @@
-import asyncio
-
+import anyio
 from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
@@ -11,7 +10,7 @@ MAX_REDIS_CONNECT_RETRIES = 3
 REDIS_CONNECT_RETRY_BACKOFF_SECONDS = 0.5
 
 _redis_client: Redis | None = None
-_redis_lock = asyncio.Lock()
+_redis_lock = anyio.Lock()
 
 
 async def _create_redis_client() -> Redis:
@@ -36,13 +35,21 @@ async def get_redis_client() -> Redis:
         if _redis_client is not None:
             return _redis_client
 
-        for attempt in range(1, MAX_REDIS_CONNECT_RETRIES + 1):
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 _redis_client = await _create_redis_client()
                 return _redis_client
             except (RedisConnectionError, RedisTimeoutError):
                 if attempt >= MAX_REDIS_CONNECT_RETRIES:
                     raise
-                await asyncio.sleep(REDIS_CONNECT_RETRY_BACKOFF_SECONDS * attempt)
+                await anyio.sleep(REDIS_CONNECT_RETRY_BACKOFF_SECONDS * attempt)
 
-    raise RuntimeError("Redis client initialization failed unexpectedly.")
+
+async def close_redis_client() -> None:
+    global _redis_client
+    if _redis_client is None:
+        return
+    await _redis_client.aclose()
+    _redis_client = None

@@ -3,6 +3,12 @@
 ## 项目简介
 基于 FastAPI + SQLAlchemy（MySQL）+ Redis 的后端服务，提供认证、留言箱、音乐、黄豆排行、标签、舰长与舰礼等 API。
 
+## Music catalog
+
+Run `alembic upgrade head` for schema changes. The catalog is normalized into songs and performances, with database-backed revision and audit tables. `data/songs.csv` and `data/song_performances.csv` are one-time UTF-8/LF seed snapshots; import them manually after migration. No upload/import API is exposed.
+
+`POST /login` grants `admin` and `music:manage`; `POST /music-manage/login` grants only `music:manage`. Configure `MUSIC_AUTH_USERNAME`, `MUSIC_AUTH_PASSWORD_HASH`, and optionally `MUSIC_TOKEN_TTL_SECONDS`.
+
 ## 环境要求
 - Python 3.11+
 - MySQL 8.0+

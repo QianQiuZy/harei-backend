@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 from pathlib import Path
 import asyncio
 import time
+from typing import Protocol
 from uuid import uuid4
 import ipaddress
 
@@ -10,20 +12,29 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from fastapi.responses import FileResponse
 from PIL import Image as PilImage, UnidentifiedImageError
 from pillow_heif import register_heif_opener
-from redis.asyncio import Redis
 from sqlalchemy import update, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.config import get_settings
 from app.core.redis import get_redis_client
 from app.db.session import get_db_session
-from app.deps.auth import get_bearer_token
+from app.deps.auth import require_admin
 from app.models.image import Image
 from app.models.message import Message
 from app.schemas.box import DeleteRequest, MessageListResponse, TagFilterRequest, UploadResponse
 from app.services.auth_service import AuthService
 
 router = APIRouter(prefix="/box")
+
+
+class AsyncScriptRedis(Protocol):
+    async def eval(
+        self,
+        script: str,
+        numkeys: int,
+        *keys_and_args: str,
+    ) -> str | list[str | int] | tuple[str | int, ...]: ...
 
 UPLOAD_ROOT = Path("uploads")
 ORIGINAL_DIR = UPLOAD_ROOT / "original"
@@ -54,6 +65,10 @@ ALLOWED_IMAGE_CONTENT_TYPES = {
     "image/heif",
     "image/heic",
 }
+MAX_UPLOAD_FILES = 6
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_UPLOAD_REQUEST_BYTES = 50 * 1024 * 1024
+MAX_DECODED_IMAGE_PIXELS = 25_000_000
 
 RATE_LIMIT_WINDOWS = (
     (30, 1),
@@ -108,13 +123,9 @@ return {1, 0}
 
 
 async def require_token(
-    token: str = Depends(get_bearer_token),
-    redis: Redis = Depends(get_redis_client),
+    _: object = Depends(require_admin),
 ) -> None:
-    service = AuthService(redis)
-    username = await service.get_username_by_token(token)
-    if not username:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    return None
 
 
 def _resolve_upload_path(path: str, allowed_dir: Path) -> Path:
@@ -128,7 +139,7 @@ def _resolve_upload_path(path: str, allowed_dir: Path) -> Path:
     return full_path
 
 
-def _process_uploaded_image(
+def process_uploaded_image(
     raw_bytes: bytes,
     file_suffix: str,
     content_type: str,
@@ -140,14 +151,24 @@ def _process_uploaded_image(
     generated_paths: list[Path] = []
 
     try:
-        original_path.write_bytes(raw_bytes)
+        _ = original_path.write_bytes(raw_bytes)
         is_gif = file_suffix == ".gif" or content_type == "image/gif"
-        if is_gif:
-            return original_path, jpg_path, thumb_path
 
-        with PilImage.open(original_path) as img:
-            img.load()
-            rgb_image = img.convert("RGB")
+        with PilImage.open(original_path) as image:
+            if image.width * image.height > MAX_DECODED_IMAGE_PIXELS:
+                original_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail={
+                        "error": "image_too_large",
+                        "max_pixels": MAX_DECODED_IMAGE_PIXELS,
+                    },
+                )
+            if is_gif:
+                _ = image.verify()
+                return original_path, jpg_path, thumb_path
+            _ = image.load()
+            rgb_image = image.convert("RGB")
 
             jpg_path = JPG_DIR / f"{filename_base}-jpg.jpg"
             generated_paths.append(jpg_path)
@@ -158,6 +179,17 @@ def _process_uploaded_image(
             thumb_path = THUMB_DIR / f"{filename_base}-thumb.jpg"
             generated_paths.append(thumb_path)
             thumb_image.save(thumb_path, format="JPEG", quality=70, optimize=True)
+    except PilImage.DecompressionBombError as exc:
+        original_path.unlink(missing_ok=True)
+        for path in generated_paths:
+            path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={
+                "error": "image_too_large",
+                "max_pixels": MAX_DECODED_IMAGE_PIXELS,
+            },
+        ) from exc
     except (UnidentifiedImageError, OSError) as exc:
         original_path.unlink(missing_ok=True)
         for path in generated_paths:
@@ -170,7 +202,7 @@ def _process_uploaded_image(
     return original_path, jpg_path, thumb_path
 
 
-async def _enforce_upload_rate_limit(redis: Redis, client_ip: str) -> None:
+async def _enforce_upload_rate_limit(redis: AsyncScriptRedis, client_ip: str) -> None:
     if client_ip == "0.0.0.0":
         return
     key = f"rate_limit:box:uploads:{client_ip}"
@@ -179,13 +211,13 @@ async def _enforce_upload_rate_limit(redis: Redis, client_ip: str) -> None:
         RATE_LIMIT_SCRIPT,
         1,
         key,
-        now,
-        RATE_LIMIT_WINDOWS[0][0],
-        RATE_LIMIT_WINDOWS[0][1],
-        RATE_LIMIT_WINDOWS[1][0],
-        RATE_LIMIT_WINDOWS[1][1],
-        RATE_LIMIT_WINDOWS[2][0],
-        RATE_LIMIT_WINDOWS[2][1],
+        str(now),
+        str(RATE_LIMIT_WINDOWS[0][0]),
+        str(RATE_LIMIT_WINDOWS[0][1]),
+        str(RATE_LIMIT_WINDOWS[1][0]),
+        str(RATE_LIMIT_WINDOWS[1][1]),
+        str(RATE_LIMIT_WINDOWS[2][0]),
+        str(RATE_LIMIT_WINDOWS[2][1]),
     )
     if isinstance(result, (list, tuple)) and result and int(result[0]) == 0:
         retry_at = int(result[1])
@@ -202,60 +234,82 @@ async def upload_message(
     tag: str | None = Form(default=None),
     files: list[UploadFile] | None = File(default=None),
     session: AsyncSession = Depends(get_db_session),
-    redis: Redis = Depends(get_redis_client),
+    redis: AsyncScriptRedis = Depends(get_redis_client),
 ) -> UploadResponse:
-    client_ip = request.headers.get("Eo-Connecting-Ip")
-    if not client_ip:
+    peer_ip = request.client.host if request.client else "0.0.0.0"
+    client_ip = peer_ip
+    if peer_ip in get_settings().trusted_proxy_hosts_list:
+        client_ip = request.headers.get("Eo-Connecting-Ip") or client_ip
         forwarded = request.headers.get("X-Forwarded-For")
-        if forwarded:
+        if forwarded and client_ip == peer_ip:
             client_ip = forwarded.split(",")[0].strip()
-    if not client_ip:
-        client_ip = request.client.host if request.client else "0.0.0.0"
     await _enforce_upload_rate_limit(redis, client_ip)
+    message_value = message.strip() if message else ""
+    tag_value = tag.strip() if tag else ""
     missing_fields: list[str] = []
-    if message is None or not message.strip():
+    if not message_value:
         missing_fields.append("message")
-    if tag is None or not tag.strip():
+    if not tag_value:
         missing_fields.append("tag")
     if missing_fields:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"missing_fields": missing_fields},
         )
-    ip_value = str(ipaddress.ip_address(client_ip))
+    if files and len(files) > MAX_UPLOAD_FILES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={"error": "too_many_files", "max_files": MAX_UPLOAD_FILES},
+        )
+    prepared_files: list[tuple[bytes, str, str]] = []
+    for upload in files or []:
+        file_suffix = Path(upload.filename or "").suffix.lower() or ".bin"
+        content_type = (upload.content_type or "").lower()
+        if (
+            file_suffix not in ALLOWED_IMAGE_EXTENSIONS
+            and content_type not in ALLOWED_IMAGE_CONTENT_TYPES
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "unsupported_image_format"},
+            )
+        raw_bytes = await upload.read(MAX_UPLOAD_BYTES + 1)
+        if len(raw_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail={"error": "file_too_large", "max_bytes": MAX_UPLOAD_BYTES},
+            )
+        prepared_files.append((raw_bytes, file_suffix, content_type))
+    try:
+        ip_value = str(ipaddress.ip_address(client_ip))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_client_ip"},
+        ) from exc
 
     ORIGINAL_DIR.mkdir(parents=True, exist_ok=True)
     THUMB_DIR.mkdir(parents=True, exist_ok=True)
     JPG_DIR.mkdir(parents=True, exist_ok=True)
 
-    message_row = Message(ip_address=ip_value, message_text=message.strip(), tag=tag.strip())
-    session.add(message_row)
-    await session.flush()
+    with ExitStack() as file_cleanup:
+        message_row = Message(ip_address=ip_value, message_text=message_value, tag=tag_value)
+        session.add(message_row)
+        await session.flush()
 
-    image_ids: list[int] = []
-    if files:
-        for upload in files:
-            raw_bytes = await upload.read()
-            file_suffix = Path(upload.filename or "").suffix.lower() or ".bin"
-            content_type = (upload.content_type or "").lower()
-            if (
-                file_suffix not in ALLOWED_IMAGE_EXTENSIONS
-                and content_type not in ALLOWED_IMAGE_CONTENT_TYPES
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail={"error": "unsupported_image_format"},
-                )
+        image_ids: list[int] = []
+        for raw_bytes, file_suffix, content_type in prepared_files:
             file_id = uuid4().hex
-
             filename_base = f"{message_row.message_id}-{file_id}"
             original_path, jpg_path, thumb_path = await asyncio.to_thread(
-                _process_uploaded_image,
+                process_uploaded_image,
                 raw_bytes,
                 file_suffix,
                 content_type,
                 filename_base,
             )
+            for path in {original_path, jpg_path, thumb_path}:
+                file_cleanup.callback(path.unlink, missing_ok=True)
 
             image_row = Image(
                 message_id=message_row.message_id,
@@ -267,7 +321,8 @@ async def upload_message(
             await session.flush()
             image_ids.append(image_row.image_id)
 
-    await session.commit()
+        await session.commit()
+        _ = file_cleanup.pop_all()
     return UploadResponse(message_id=message_row.message_id, image_ids=image_ids, code=0)
 
 
@@ -311,7 +366,7 @@ async def list_pending(
         .order_by(Message.created_at.desc())
     )
     messages = result.scalars().all()
-    return MessageListResponse.from_messages(messages)
+    return MessageListResponse.from_messages(list(messages))
 
 
 @router.get("/approved", response_model=MessageListResponse)
@@ -326,7 +381,7 @@ async def list_approved(
         .order_by(Message.created_at.desc())
     )
     messages = result.scalars().all()
-    return MessageListResponse.from_messages(messages)
+    return MessageListResponse.from_messages(list(messages))
 
 
 @router.post("/approve")
@@ -334,7 +389,7 @@ async def approve_all(
     payload: TagFilterRequest | None = None,
     session: AsyncSession = Depends(get_db_session),
     _: None = Depends(require_token),
-) -> dict:
+) -> dict[str, int | str]:
     stmt = update(Message).where(Message.status == "pending")
     if payload and payload.tag:
         stmt = stmt.where(Message.tag == payload.tag)
@@ -350,7 +405,7 @@ async def delete_message(
     payload: DeleteRequest,
     session: AsyncSession = Depends(get_db_session),
     _: None = Depends(require_token),
-) -> dict:
+) -> dict[str, int | str]:
     result = await session.execute(
         update(Message)
         .where(Message.message_id == payload.id)
@@ -367,7 +422,7 @@ async def archived_all(
     payload: TagFilterRequest | None = None,
     session: AsyncSession = Depends(get_db_session),
     _: None = Depends(require_token),
-) -> dict:
+) -> dict[str, int | str]:
     stmt = update(Message).where(Message.status == "approved")
     if payload and payload.tag:
         stmt = stmt.where(Message.tag == payload.tag)

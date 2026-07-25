@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.redis import get_redis_client
 from app.db.session import get_db_session
-from app.deps.auth import get_bearer_token
+from app.deps.auth import require_admin
 from app.models.tag import Tag
 from app.schemas.tag import TagCreateRequest, TagListResponse, TagNameResponse, TagUpdateRequest
 from app.services.auth_service import AuthService
@@ -14,13 +14,9 @@ router = APIRouter(prefix="/tag")
 
 
 async def require_token(
-    token: str = Depends(get_bearer_token),
-    redis: Redis = Depends(get_redis_client),
+    _: object = Depends(require_admin),
 ) -> None:
-    service = AuthService(redis)
-    username = await service.get_username_by_token(token)
-    if not username:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    return None
 
 
 @router.get("/active", response_model=TagNameResponse)

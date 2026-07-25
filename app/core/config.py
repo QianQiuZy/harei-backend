@@ -43,8 +43,12 @@ class Settings(BaseSettings):
 
     auth_username: str
     auth_password_hash: str
+    music_auth_username: str = ""
+    music_auth_password_hash: str = ""
+    music_token_ttl_seconds: int | None = None
 
     cors_allow_origins: str = "https://harei.cn,https://api.harei.cn"
+    trusted_proxy_hosts: str = "127.0.0.1,::1"
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 
@@ -55,6 +59,10 @@ class Settings(BaseSettings):
     @property
     def email_cc_list(self) -> list[str]:
         return [email.strip() for email in self.email_cc.split(",") if email.strip()]
+
+    @property
+    def trusted_proxy_hosts_list(self) -> list[str]:
+        return [host.strip() for host in self.trusted_proxy_hosts.split(",") if host.strip()]
 
 
 @lru_cache
