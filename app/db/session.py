@@ -1,7 +1,8 @@
-import asyncio
+from collections.abc import AsyncGenerator
 
+import anyio
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError, OperationalError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
@@ -21,15 +22,23 @@ async_session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_o
 MAX_DB_CONNECT_RETRIES = 3
 DB_CONNECT_RETRY_BACKOFF_SECONDS = 0.5
 
-async def get_db_session() -> AsyncSession:
+async def get_db_session() -> AsyncGenerator[AsyncSession]:
     for attempt in range(1, MAX_DB_CONNECT_RETRIES + 1):
+        session = async_session_factory()
         try:
-            async with async_session_factory() as session:
-                await session.execute(text("SELECT 1"))
-                yield session
+            try:
+                _ = await session.execute(text("SELECT 1"))
+            except DBAPIError:
+                if attempt >= MAX_DB_CONNECT_RETRIES:
+                    raise
+            else:
+                try:
+                    yield session
+                finally:
+                    if session.in_transaction():
+                        await session.rollback()
                 return
-        except (OperationalError, DBAPIError):
-            if attempt >= MAX_DB_CONNECT_RETRIES:
-                raise
-            await engine.dispose()
-            await asyncio.sleep(DB_CONNECT_RETRY_BACKOFF_SECONDS * attempt)
+        finally:
+            await session.close()
+        await engine.dispose()
+        await anyio.sleep(DB_CONNECT_RETRY_BACKOFF_SECONDS * attempt)

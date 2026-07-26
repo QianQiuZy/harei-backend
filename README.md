@@ -5,7 +5,15 @@
 
 ## Music catalog
 
-Run `alembic upgrade head` for schema changes. The catalog is normalized into songs and performances, with database-backed revision and audit tables. `data/songs.csv` and `data/song_performances.csv` are one-time UTF-8/LF seed snapshots; import them manually after migration. No upload/import API is exposed.
+每次发布后端代码、重启服务前，必须先在相同 `.env` 环境中执行数据库升级：
+
+```bash
+alembic upgrade head
+```
+
+迁移支持已有 `songs` 数据但缺少修订表或审计表的数据库，会补齐 `music_catalog_revision` 和 `music_audit_events`，不会删除现有歌曲。曲库使用规范化的歌曲和演出记录表，修订号与审计记录均存储在数据库中。
+
+如果数据库只有旧版 `music` 表而没有 `songs`，迁移会保留旧表，但不会自动转换旧数据；发布前应先按 `data/README.md` 完成曲库导入。
 
 `POST /login` grants `admin` and `music:manage`; `POST /music-manage/login` grants only `music:manage`. Configure `MUSIC_AUTH_USERNAME`, `MUSIC_AUTH_PASSWORD_HASH`, and optionally `MUSIC_TOKEN_TTL_SECONDS`.
 
