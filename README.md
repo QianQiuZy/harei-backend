@@ -48,6 +48,26 @@ cp env.example .env
 
 如需月底在舰列表邮件增加抄送，可配置 `EMAIL_CC`（多个邮箱使用英文逗号分隔）。
 
+## B站直播监听
+
+监听器默认关闭。生产环境必须在 `.env` 中设置：
+
+```bash
+BILI_MONITOR_ENABLED=true
+BILI_ROOM_IDS=1820703922
+BILI_SESSDATA=
+BILI_BILI_JCT=
+BILI_DEDEUSERID=
+BILI_DEDEUSERID_CKMD5=
+BILI_SID=
+BILI_BUVID3=
+BILI_DEVICE_FINGERPRINT=
+```
+
+启动日志应依次出现“所有 UID 已成功获取”、“后台监听已启动”和“已连接房间”。`GET /live/status` 返回的是当前进程的内存状态，因此运行监听器时应使用单个 Uvicorn worker，避免多个进程重复连接和状态不一致。
+
+项目根目录中的 `blivedm/` 是随服务部署的 vendored 副本；当前消息协议同步自 `VR_douchong/blivedm`，包括 `SEND_GIFT_V2` 支持。
+
 ## 运行服务（Uvicorn）
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000
