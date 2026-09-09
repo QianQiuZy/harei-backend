@@ -501,12 +501,12 @@
 {
   "code": 0,
   "items": [
-    { "month": "202512", "path": "uploads/captaingift/202512.jpg" }
+    { "month": "202512", "path": "uploads/captaingift/202512_<sha256>.jpg" }
   ]
 }
 ```
 
-### GET `/captaingift/image?month=YYYYMM`（无需 Token）
+### GET `/captaingift/image?path=uploads/captaingift/YYYYMM_<sha256>.jpg`（无需 Token）
 **响应**：图片文件
 
 ### POST `/captaingift/add`（需要 Token）
@@ -517,6 +517,17 @@
 **响应**
 ```json
 { "code": 0, "message": "202512已上传" }
+```
+
+### POST `/captaingift/delete`（需要 Token）
+**请求体**
+```json
+{ "month": "202512" }
+```
+
+**响应**
+```json
+{ "code": 0, "message": "202512已删除" }
 ```
 
 ## 直播监控 /live

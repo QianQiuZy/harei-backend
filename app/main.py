@@ -21,6 +21,7 @@ from app.api.tag import router as tag_router
 from app.core.config import get_settings
 from app.core.redis import close_redis_client
 from app.db.session import engine
+from app.services.captain_gift_archive import migrate_legacy_captaingift_images
 
 settings = get_settings()
 
@@ -92,6 +93,7 @@ class UploadBodyLimitMiddleware:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    await migrate_legacy_captaingift_images()
     await bili_captain_listener.bootstrap()
     try:
         yield
