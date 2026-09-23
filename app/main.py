@@ -11,6 +11,7 @@ from app.api.box import MAX_UPLOAD_REQUEST_BYTES, router as box_router
 from app.api.captaingift import router as captaingift_router
 from app.api.captains import router as captains_router
 from app.api.download import router as download_router
+from app.api.emoji import router as emoji_router
 from app.api.live import router as live_router
 from app.api.huangdou import router as huangdou_router
 from app.api.music import router as music_router
@@ -119,6 +120,7 @@ app.include_router(captaingift_router)
 app.include_router(captains_router)
 app.include_router(live_router)
 app.include_router(download_router)
+app.include_router(emoji_router)
 
 app.include_router(huangdou_router)
 app.include_router(music_router)

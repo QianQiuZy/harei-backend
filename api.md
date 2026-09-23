@@ -147,6 +147,33 @@
 { "code": 0, "message": "X条消息已归档" }
 ```
 
+## 表情包 /emoji
+### GET `/emoji`（无需 Token）
+**响应**：`groups` 按组名返回表情包名称（不含扩展名）；`files` 给出每个表情的实际文件名，`group_icons` 给出根目录中与组名对应的切换栏图标文件名。新留言使用 `[[组名/表情包名称]]` 保存标记；历史 `[[表情包名称]]` 标记仍由前端兼容显示。
+```json
+{
+  "code": 0,
+  "groups": {
+    "dlc_act": ["prpr", "小猫打"],
+    "emotelab": ["摸头", "笑"]
+  },
+  "files": {
+    "dlc_act": {"prpr": "prpr.png", "小猫打": "小猫打.png"},
+    "emotelab": {"摸头": "摸头.gif", "笑": "笑.gif"}
+  },
+  "group_icons": {
+    "dlc_act": "dlc_act.png",
+    "emotelab": "emotelab.gif"
+  }
+}
+```
+
+### GET `/emoji/{group_name}/{emoji_name}`（无需 Token）
+**响应**：对应表情包图片文件。图片文件存放在后端 `emoji_assets/{group_name}/` 目录中。
+
+### GET `/emoji/group-icon/{group_name}`（无需 Token）
+**响应**：对应表情包组的切换栏图标，文件名由 `GET /emoji` 响应中的 `group_icons[group_name]` 给出。
+
 ## 下载 /download
 ### GET `/download/active`（无需 Token）
 **响应**
