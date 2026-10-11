@@ -31,8 +31,15 @@ async def _song_or_404(session: AsyncSession, song_id: int) -> Song:
 @router.post("/login", response_model=LoginResponse)
 async def login(payload: LoginRequest, redis: Redis = Depends(get_redis_client)) -> LoginResponse:
     service = AuthService(redis)
-    if not service.verify_music_credentials(payload.username, payload.password): raise HTTPException(status_code=401, detail="Unauthorized")
-    token, principal = await service.issue_token(payload.username, ["music:manage"], get_settings().music_token_ttl_seconds)
+    if service.verify_credentials(payload.username, payload.password):
+        scopes = ["admin", "music:manage"]
+        ttl_seconds = None  # Main accounts retain the normal admin token lifetime.
+    elif service.verify_music_credentials(payload.username, payload.password):
+        scopes = ["music:manage"]
+        ttl_seconds = get_settings().music_token_ttl_seconds
+    else:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    token, principal = await service.issue_token(payload.username, scopes, ttl_seconds)
     return LoginResponse(token=token, user=UserInfo(username=payload.username), scopes=principal.scopes, expires_at=principal.expires_at)
 
 @router.get("/stats")

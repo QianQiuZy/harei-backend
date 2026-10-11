@@ -4,10 +4,12 @@ import asyncio
 import calendar
 import datetime
 import http.cookies
+import json
 import logging
 import random
 import smtplib
 import threading
+import tempfile
 from dataclasses import dataclass
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
@@ -18,10 +20,11 @@ from typing import Any, Dict, Optional
 import aiohttp
 import blivedm
 from aiohttp import ContentTypeError
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
 from app.core.config import get_settings
+from app.core.redis import get_redis_client
 from app.db.session import async_session_factory
 from sqlalchemy import select
 from sqlalchemy.dialects.mysql import insert
@@ -44,7 +47,9 @@ ROOM_UIDS: Dict[int, int] = {}
 
 LAST_STATUS: Dict[int, int] = {}
 LIVE_INFO: Dict[int, Dict[str, str]] = {}
-GUARD_SNAPSHOT_COUNTS: Dict[str, int] = {}
+GUARD_REPORT_LOCK = asyncio.Lock()
+GUARD_LATE_EVENTS: dict[str, dict[str, dict[str, Any]]] = {}
+GUARD_EVENT_TASKS: set[asyncio.Task] = set()
 
 COOKIE_ALERT_SENT = False
 
@@ -112,13 +117,14 @@ def _next_month_report_time(now: datetime.datetime) -> datetime.datetime:
 
 def _next_guard_snapshot_time(now: datetime.datetime) -> datetime.datetime:
     last_day = calendar.monthrange(now.year, now.month)[1]
-    target = datetime.datetime(year=now.year, month=now.month, day=last_day, hour=23, minute=59, second=0)
-    if now <= target:
-        return target
+    for day in ([30, 31] if last_day == 31 else [last_day]):
+        target = datetime.datetime(now.year, now.month, day, 23, 55)
+        if now <= target:
+            return target
     year = now.year + (1 if now.month == 12 else 0)
     month = 1 if now.month == 12 else now.month + 1
     last_day = calendar.monthrange(year, month)[1]
-    return datetime.datetime(year=year, month=month, day=last_day, hour=23, minute=59, second=0)
+    return datetime.datetime(year, month, 30 if last_day == 31 else last_day, 23, 55)
 
 
 def _report_month_for_target(target_time: datetime.datetime) -> str:
@@ -188,6 +194,8 @@ GUARD_REPORT_RECEIVER = "harei0301@163.com"
 GUARD_REPORT_ROOT = Path("download_files")
 GUARD_REPORT_RUID = 1048135385
 GUARD_REPORT_ROOM_ID = 1820703922
+GUARD_CACHE_TTL = 90 * 24 * 60 * 60
+GUARD_FETCH_ATTEMPTS = 3
 
 
 async def _fetch_room_uid(room_id: int) -> Optional[int]:
@@ -354,10 +362,20 @@ def _level_name(guard_level: Any) -> Optional[str]:
     return None
 
 
-async def _fetch_guard_page(page: int) -> list[dict[str, Any]]:
+class GuardSnapshotError(RuntimeError):
+    """An incomplete/failed snapshot must never become a successful report."""
+
+
+@dataclass(slots=True)
+class GuardPage:
+    rows: list[dict[str, Any]]
+    total: int
+    pages: int
+
+
+async def _fetch_guard_page(page: int) -> GuardPage:
     if aiohttp_session is None:
-        logger.error("[Guard] aiohttp_session 未初始化，无法拉取在舰列表")
-        return []
+        raise GuardSnapshotError("aiohttp_session 未初始化")
 
     params = {
         "ruid": GUARD_REPORT_RUID,
@@ -366,34 +384,42 @@ async def _fetch_guard_page(page: int) -> list[dict[str, Any]]:
         "page_size": 30,
         "typ": 5,
     }
-    try:
-        async with aiohttp_session.get(
-            GUARD_LIST_API,
-            params=params,
-            timeout=10,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Referer": f"https://live.bilibili.com/{GUARD_REPORT_ROOM_ID}",
-            },
-        ) as resp:
-            if resp.status != 200:
-                logger.warning("[Guard] page=%s HTTP %s", page, resp.status)
-                return []
-            try:
+    for attempt in range(GUARD_FETCH_ATTEMPTS):
+        try:
+            async with aiohttp_session.get(
+                GUARD_LIST_API,
+                params=params,
+                timeout=10,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Referer": f"https://live.bilibili.com/{GUARD_REPORT_ROOM_ID}",
+                },
+            ) as resp:
+                if resp.status != 200:
+                    raise GuardSnapshotError(f"page={page} HTTP {resp.status}")
                 payload = await resp.json(content_type=None)
-            except ContentTypeError:
-                text = (await resp.text())[:200]
-                logger.warning("[Guard] page=%s 非 JSON，前 200 字：%s", page, text)
-                return []
-    except Exception as e:
-        logger.error("[Guard] page=%s 请求异常: %s", page, e)
-        return []
-
-    data = payload.get("data") or {}
-    raw_list = data.get("list") or []
-    if not isinstance(raw_list, list):
-        return []
-    return raw_list
+            if payload.get("code") != 0:
+                raise GuardSnapshotError(f"page={page} API code={payload.get('code')}")
+            data = payload["data"]
+            info = data["info"]
+            total, page_count = int(info["num"]), int(info["page"])
+            if total < 0 or not 0 <= page_count <= 10000 or int(info["now"]) != page:
+                raise GuardSnapshotError(f"page={page} 分页元数据无效")
+            pages = max(1, page_count)
+            raw_list = [] if data["list"] is None else data["list"]
+            top3 = [] if data["top3"] is None else data["top3"]
+            if not isinstance(raw_list, list) or not isinstance(top3, list):
+                raise GuardSnapshotError(f"page={page} 名单结构无效")
+            # top3 is returned on every page, separately from list (rank 4+).
+            return GuardPage(_normalize_guard_rows(top3 + raw_list), total, pages)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError,
+                KeyError, AttributeError, GuardSnapshotError) as exc:
+            if attempt + 1 == GUARD_FETCH_ATTEMPTS:
+                raise GuardSnapshotError(f"page={page} 抓取失败（已重试）") from exc
+            logger.warning("[Guard] page=%s 抓取失败，重试 %s/%s: %s",
+                           page, attempt + 1, GUARD_FETCH_ATTEMPTS, exc)
+            await asyncio.sleep(attempt + 1)
+    raise GuardSnapshotError("抓取重试耗尽")
 
 
 def _normalize_guard_rows(raw_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -402,24 +428,45 @@ def _normalize_guard_rows(raw_list: list[dict[str, Any]]) -> list[dict[str, Any]
         uinfo = item.get("uinfo") or {}
         base = uinfo.get("base") or {}
         guard = uinfo.get("guard") or {}
-        uid = uinfo.get("uid") or base.get("uid") or ""
+        uid = str(int(uinfo.get("uid") or base.get("uid") or 0))
         name = base.get("name") or ""
         level = _level_name(guard.get("level")) or ""
-        rows.append({"uid": uid, "name": name, "level": level})
+        if int(uid) <= 0 or not level:
+            raise GuardSnapshotError("在舰列表包含无效 UID 或等级")
+        rows.append({"uid": uid, "name": str(name), "level": level})
     return rows
+
+
+def _merge_guard_rows(*sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate by canonical UID; later sources supply the latest identity."""
+    merged: dict[str, dict[str, Any]] = {}
+    for source in sources:
+        for row in source:
+            uid = str(int(row["uid"]))
+            if int(uid) <= 0 or row["level"] not in ("舰长", "提督", "总督"):
+                raise GuardSnapshotError("快照包含无效 UID 或等级")
+            merged[uid] = {"uid": uid, "name": str(row["name"]), "level": row["level"]}
+    return list(merged.values())
 
 
 async def _collect_guard_rows() -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    page = 1
-    while True:
-        raw_list = await _fetch_guard_page(page)
-        if not raw_list:
-            break
-        rows.extend(_normalize_guard_rows(raw_list))
-        page += 1
-        await asyncio.sleep(0.5)
-    return rows
+    for attempt in range(GUARD_FETCH_ATTEMPTS):
+        first = await _fetch_guard_page(1)
+        rows = first.rows
+        consistent = True
+        for page in range(2, first.pages + 1):
+            await asyncio.sleep(0.5)
+            current = await _fetch_guard_page(page)
+            if (current.total, current.pages) != (first.total, first.pages):
+                consistent = False
+                break
+            rows = _merge_guard_rows(rows, current.rows)
+        rows = _merge_guard_rows(rows)
+        if consistent and len(rows) == first.total:
+            return rows
+        logger.warning("[Guard] 名单变化/人数不符 expected=%s actual=%s，整轮重试 %s/%s",
+                       first.total, len(rows), attempt + 1, GUARD_FETCH_ATTEMPTS)
+    raise GuardSnapshotError("在舰列表人数校验失败，拒绝生成不完整快照")
 
 
 def _build_guard_report_xlsx(rows: list[dict[str, Any]], month: str) -> Path:
@@ -446,7 +493,15 @@ def _build_guard_report_xlsx(rows: list[dict[str, Any]], month: str) -> Path:
 
     filename = f"{month}在舰列表.xlsx"
     file_path = GUARD_REPORT_ROOT / filename
-    workbook.save(file_path)
+    # Replace atomically: a restart must not leave a half-written attachment.
+    with tempfile.NamedTemporaryFile(dir=GUARD_REPORT_ROOT, suffix=".xlsx", delete=False) as tmp:
+        temporary_path = Path(tmp.name)
+    try:
+        workbook.save(temporary_path)
+        temporary_path.replace(file_path)
+    finally:
+        workbook.close()
+        temporary_path.unlink(missing_ok=True)
     return file_path
 
 
@@ -458,14 +513,102 @@ async def _collect_monthly_captain_rows(month: str) -> list[Captain]:
         return list(result.scalars().all())
 
 
-async def _snapshot_guard_report(target_time: datetime.datetime) -> Path:
-    month = target_time.strftime("%Y%m")
-    logger.info("[Guard] 开始拉取 %s 在舰列表快照", month)
-    guard_rows = await _collect_guard_rows()
-    GUARD_SNAPSHOT_COUNTS[month] = len(guard_rows)
-    guard_file_path = _build_guard_report_xlsx(guard_rows, month)
-    logger.info("[Guard] 在舰列表快照已生成 month=%s count=%s path=%s", month, len(guard_rows), guard_file_path)
-    return guard_file_path
+def _guard_cache_key(month: str, kind: str) -> str:
+    return f"harei:guard-report:{GUARD_REPORT_ROOM_ID}:{month}:{kind}"
+
+
+async def _load_guard_cache(month: str, kind: str) -> Optional[list[dict[str, Any]]]:
+    redis = await get_redis_client()
+    raw = await redis.get(_guard_cache_key(month, kind))
+    if raw is None:
+        return None
+    data = json.loads(raw)
+    if (data["month"] != month or data["room_id"] != GUARD_REPORT_ROOM_ID
+            or not isinstance(data["rows"], list)):
+        raise GuardSnapshotError("Redis 快照元数据无效")
+    return _merge_guard_rows(data["rows"])
+
+
+async def _save_guard_cache(month: str, kind: str, rows: list[dict[str, Any]],
+                            target_time: datetime.datetime) -> None:
+    redis = await get_redis_client()
+    data = {"month": month, "room_id": GUARD_REPORT_ROOM_ID,
+            "target_time": target_time.isoformat(), "rows": rows}
+    await redis.set(_guard_cache_key(month, kind), json.dumps(data, ensure_ascii=False),
+                    ex=GUARD_CACHE_TTL)
+
+
+async def _persist_late_guard_event(month: str, field: str, row: dict[str, Any]) -> None:
+    try:
+        redis = await get_redis_client()
+        async with redis.pipeline(transaction=True) as pipe:
+            pipe.hset(_guard_cache_key(month, "late-events"), field,
+                      json.dumps(row, ensure_ascii=False))
+            pipe.expire(_guard_cache_key(month, "late-events"), GUARD_CACHE_TTL)
+            await pipe.execute()
+    except Exception:
+        # Retain the in-process copy; the database event is also written normally.
+        logger.exception("[Guard] month=%s 新上舰事件 Redis 缓存失败", month)
+
+
+def _queue_late_guard_event(ev: CaptainEvent, room_id: int) -> None:
+    month = month_str(ev.joined_at)
+    if room_id != GUARD_REPORT_ROOM_ID or ev.joined_at < _guard_snapshot_target_for_month(month):
+        return
+    # Record synchronously before scheduling Redis I/O, so a concurrent fetch
+    # cannot miss an event that has already reached the handler.
+    field = f"{ev.joined_at.isoformat()}:{ev.uid}"
+    row = {"uid": ev.uid, "name": ev.username, "level": ev.level}
+    GUARD_LATE_EVENTS.setdefault(month, {})[field] = row
+    task = asyncio.create_task(_persist_late_guard_event(month, field, row))
+    GUARD_EVENT_TASKS.add(task)
+    task.add_done_callback(GUARD_EVENT_TASKS.discard)
+
+
+async def _late_guard_rows(month: str) -> list[dict[str, Any]]:
+    redis = await get_redis_client()
+    events = await redis.hgetall(_guard_cache_key(month, "late-events"))
+    records = {field: json.loads(value) for field, value in events.items()}
+    records.update(GUARD_LATE_EVENTS.get(month, {}))
+    return _merge_guard_rows([records[field] for field in sorted(records)])
+
+
+async def _snapshot_guard_report(target_time: datetime.datetime) -> Optional[Path]:
+    async with GUARD_REPORT_LOCK:
+        # Never fetch next month's live state under the previous month's label.
+        if _now().date() != target_time.date():
+            raise GuardSnapshotError("已跨过抓取日期，不能用当前名单冒充历史快照")
+        month = target_time.strftime("%Y%m")
+        last_day = calendar.monthrange(target_time.year, target_time.month)[1]
+        is_preliminary = last_day == 31 and target_time.day == 30
+        saved = await _load_guard_cache(month, "day30" if is_preliminary else "final")
+        if saved is not None:
+            # Restart/retry must not replace an already-complete 23:55 snapshot
+            # with a later state where some of those members have expired.
+            if is_preliminary:
+                return None
+            rows = _merge_guard_rows(saved, await _late_guard_rows(month))
+            await _save_guard_cache(month, "final", rows, target_time)
+            return await asyncio.to_thread(_build_guard_report_xlsx, rows, month)
+        prior_rows: list[dict[str, Any]] = []
+        if last_day == 31 and not is_preliminary:
+            cached = await _load_guard_cache(month, "day30")
+            if cached is None:
+                raise GuardSnapshotError(f"{month} 缺少 30 号快照，不能生成双日合并名单")
+            prior_rows = cached
+        logger.info("[Guard] 开始拉取 %s 在舰列表快照 day=%s", month, target_time.day)
+        rows = await _collect_guard_rows()
+        if _now().date() != target_time.date():
+            raise GuardSnapshotError("抓取过程跨日，拒绝将跨日数据写入快照")
+        if is_preliminary:
+            await _save_guard_cache(month, "day30", rows, target_time)
+            logger.info("[Guard] 30 号快照已存入 Redis month=%s count=%s", month, len(rows))
+            return None
+        rows = _merge_guard_rows(prior_rows, rows, await _late_guard_rows(month))
+        await _save_guard_cache(month, "final", rows, target_time)
+        path = await asyncio.to_thread(_build_guard_report_xlsx, rows, month)
+        logger.info("[Guard] 在舰列表快照已生成 month=%s count=%s path=%s", month, len(rows), path)
+        return path
 
 
 def _guard_snapshot_path(month: str) -> Path:
@@ -476,7 +619,23 @@ def _guard_snapshot_target_for_month(month: str) -> datetime.datetime:
     year = int(month[:4])
     month_num = int(month[4:6])
     last_day = calendar.monthrange(year, month_num)[1]
-    return datetime.datetime(year=year, month=month_num, day=last_day, hour=23, minute=59, second=0)
+    return datetime.datetime(year, month_num, last_day, 23, 55)
+
+
+def _read_guard_snapshot(month: str) -> list[dict[str, Any]]:
+    workbook = load_workbook(_guard_snapshot_path(month), read_only=True)
+    try:
+        worksheet = workbook.active
+        assert worksheet is not None
+        values = worksheet.iter_rows(values_only=True)
+        if next(values, None) != ("UID", "用户名", "舰长等级"):
+            raise GuardSnapshotError("在舰附件表头无效")
+        return _merge_guard_rows([
+            {"uid": uid, "name": name or "", "level": level}
+            for uid, name, level in values
+        ])
+    finally:
+        workbook.close()
 
 
 def _send_guard_report_email(
@@ -488,8 +647,7 @@ def _send_guard_report_email(
 ) -> None:
     settings = get_settings()
     if not (settings.smtp_host and settings.email_from):
-        logger.warning("[SMTP] 未配置 SMTP_HOST/EMAIL_FROM，跳过月度舰长邮件")
-        return
+        raise GuardSnapshotError("未配置 SMTP_HOST/EMAIL_FROM，月度舰长邮件未发送")
 
     cc_list = settings.email_cc_list
 
@@ -534,52 +692,88 @@ def _send_guard_report_email(
 
 async def _run_guard_report(target_time: datetime.datetime) -> None:
     await CAPTAIN_QUEUE.join()
+    if GUARD_EVENT_TASKS:
+        await asyncio.gather(*list(GUARD_EVENT_TASKS))
     month = _report_month_for_target(target_time)
-    logger.info("[Guard] 开始生成 %s 月度舰长邮件", month)
-    guard_file_path = _guard_snapshot_path(month)
-    if not guard_file_path.exists():
-        logger.warning("[Guard] 未找到 %s 在舰列表快照，补拉一次当前在舰列表", month)
-        guard_file_path = await _snapshot_guard_report(_guard_snapshot_target_for_month(month))
-    captain_rows = await _collect_monthly_captain_rows(month)
-    captain_file_path = save_captains_xlsx(captain_rows, month, GUARD_REPORT_ROOT)
-    guard_total = GUARD_SNAPSHOT_COUNTS.get(month, -1)
-    await asyncio.to_thread(
-        _send_guard_report_email,
-        guard_file_path,
-        captain_file_path,
-        month,
-        guard_total,
-        len(captain_rows),
-    )
-    logger.info(
-        "[Guard] 月度舰长邮件已发送 month=%s guard_count=%s captain_count=%s guard_path=%s captain_path=%s",
-        month,
-        guard_total,
-        len(captain_rows),
-        guard_file_path,
-        captain_file_path,
-    )
+    async with GUARD_REPORT_LOCK:
+        redis = await get_redis_client()
+        if await redis.get(_guard_cache_key(month, "sent")):
+            logger.info("[Guard] month=%s 月度邮件已经发送，跳过", month)
+            return
+        logger.info("[Guard] 开始生成 %s 月度舰长邮件", month)
+        rows = await _load_guard_cache(month, "final")
+        if rows is None:
+            path = _guard_snapshot_path(month)
+            if not path.exists():
+                raise GuardSnapshotError(f"{month} 缺少月底快照，拒绝用次月实时数据补拉")
+            # Also supports existing attachments made before Redis persistence.
+            rows = await asyncio.to_thread(_read_guard_snapshot, month)
+        rows = _merge_guard_rows(rows, await _late_guard_rows(month))
+        await _save_guard_cache(month, "final", rows, _guard_snapshot_target_for_month(month))
+        guard_file_path = await asyncio.to_thread(_build_guard_report_xlsx, rows, month)
+        captain_rows = await _collect_monthly_captain_rows(month)
+        captain_file_path = await asyncio.to_thread(
+            save_captains_xlsx, captain_rows, month, GUARD_REPORT_ROOT)
+        await asyncio.to_thread(_send_guard_report_email, guard_file_path, captain_file_path,
+                                month, len(rows), len(captain_rows))
+        await redis.set(_guard_cache_key(month, "sent"), "1", ex=GUARD_CACHE_TTL)
+        GUARD_LATE_EVENTS.pop(month, None)
+        logger.info("[Guard] 月度舰长邮件已发送 month=%s guard_count=%s captain_count=%s",
+                    month, len(rows), len(captain_rows))
+
+
+async def _guard_snapshot_scheduler() -> None:
+    now = _now()
+    last_day = calendar.monthrange(now.year, now.month)[1]
+    today = now.replace(hour=23, minute=55, second=0, microsecond=0)
+    # A restart during the last five minutes may still capture today's state.
+    if now.day in ([30, 31] if last_day == 31 else [last_day]) and now >= today:
+        target = today
+    else:
+        target = _next_guard_snapshot_time(now)
+    while True:
+        await asyncio.sleep(max(0, (target - _now()).total_seconds()))
+        while True:
+            try:
+                await _snapshot_guard_report(target)
+                break
+            except Exception:
+                logger.exception("[Guard] 在舰快照任务失败 target=%s", target)
+                if _now().date() != target.date():
+                    break
+                await asyncio.sleep(30)
+        target = _next_guard_snapshot_time(target + datetime.timedelta(seconds=1))
+
+
+async def _guard_email_scheduler() -> None:
+    now = _now()
+    # Startup/restart waits for the next scheduled send, never backfills a
+    # historical report just because its Redis sent marker is missing.
+    target = _next_month_report_time(now)
+    while True:
+        await asyncio.sleep(max(0, (target - _now()).total_seconds()))
+        for attempt in range(3):
+            try:
+                await _run_guard_report(target)
+                break
+            except Exception:
+                logger.exception("[Guard] 月度邮件任务失败 target=%s", target)
+                if attempt < 2:
+                    await asyncio.sleep(30)
+        # Advance from the scheduled target, not completion time. Long-running
+        # snapshots cannot push a due 00:01 report to the following month.
+        target = _next_month_report_time(target + datetime.timedelta(seconds=1))
 
 
 async def guard_report_scheduler() -> None:
-    while True:
-        now = _now()
-        snapshot_target = _next_guard_snapshot_time(now)
-        report_target = _next_month_report_time(now)
-        target = snapshot_target if snapshot_target <= report_target else report_target
-        sleep_sec = max(1.0, (target - now).total_seconds())
-        logger.info("[Guard] 距离下一次月度舰长任务还有约 %.1f 分钟", sleep_sec / 60.0)
-        await asyncio.sleep(sleep_sec)
-
-        try:
-            if target == snapshot_target:
-                await _snapshot_guard_report(target)
-            else:
-                await _run_guard_report(target)
-        except asyncio.CancelledError:
-            logger.debug("[Guard] 在舰列表任务 Cancelled（预期）")
-        except Exception as e:
-            logger.error("[Guard] 在舰列表任务失败: %s", e)
+    snapshot_task = asyncio.create_task(_guard_snapshot_scheduler())
+    email_task = asyncio.create_task(_guard_email_scheduler())
+    try:
+        await asyncio.gather(snapshot_task, email_task)
+    finally:
+        snapshot_task.cancel()
+        email_task.cancel()
+        await asyncio.gather(snapshot_task, email_task, return_exceptions=True)
 
 
 async def captain_writer_worker() -> None:
@@ -730,6 +924,8 @@ class MyHandler(blivedm.BaseHandler):
                 joined_at=_now(),
             )
 
+            _queue_late_guard_event(ev, client.room_id)
+
             try:
                 CAPTAIN_QUEUE.put_nowait(ev)
             except asyncio.QueueFull:
@@ -814,6 +1010,8 @@ async def shutdown() -> None:
         except Exception:
             pass
     ROOM_CLIENTS.clear()
+    if GUARD_EVENT_TASKS:
+        await asyncio.gather(*list(GUARD_EVENT_TASKS))
 
     global aiohttp_session
     if aiohttp_session:
