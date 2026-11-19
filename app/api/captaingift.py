@@ -101,7 +101,7 @@ async def upload_captaingift(
         session.add(CaptainGiftArchive(gift_month=month, image_path=str(target_path)))
     await session.commit()
 
-    if previous_path is not None and previous_path != target_path:
+    if previous_path is not None and previous_path != target_path.resolve():
         try:
             _ = previous_path.unlink(missing_ok=True)
         except OSError as exc:
