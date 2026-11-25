@@ -486,6 +486,7 @@ def test_smtp_message_counts_attachments_and_cc(listener, monkeypatch):
     from pydantic import SecretStr
 
     settings = types.SimpleNamespace(gift_smtp_host="smtp.example.invalid", gift_smtp_port=465,
+                                     gift_smtp_ca_file="/etc/ssl/test-ca-bundle.pem",
                                      gift_smtp_pass=SecretStr("test-only"), gift_email_from="from@example.invalid",
                                      email_cc_list=["cc@example.invalid"])
     monkeypatch.setattr(listener, "get_settings", lambda: settings)
@@ -493,12 +494,15 @@ def test_smtp_message_counts_attachments_and_cc(listener, monkeypatch):
     context = Mock()
     context.__enter__ = Mock(return_value=server)
     context.__exit__ = Mock(return_value=False)
+    tls_context = Mock()
+    create_tls_context = Mock(return_value=tls_context)
+    monkeypatch.setattr(listener.ssl, "create_default_context", create_tls_context)
     monkeypatch.setattr(listener.smtplib, "SMTP_SSL", Mock(return_value=context))
     guard = listener._build_guard_report_xlsx([row(1), row(2)], "202611")
     captain = listener.save_captains_xlsx([], "202611", listener.GUARD_REPORT_ROOT)
     listener.original_send_guard_report_email(guard, captain, "202611", 2, 0)
-    listener.smtplib.SMTP_SSL.assert_called_once()
-    assert listener.smtplib.SMTP_SSL.call_args.args == (settings.gift_smtp_host, 465)
+    create_tls_context.assert_called_once_with(cafile=settings.gift_smtp_ca_file)
+    listener.smtplib.SMTP_SSL.assert_called_once_with(settings.gift_smtp_host, 465, timeout=12, context=tls_context)
     server.login.assert_called_once_with(settings.gift_email_from, "test-only")
     envelope = server.send_message.call_args
     assert envelope.kwargs == {"from_addr": settings.gift_email_from, "to_addrs": [listener.GUARD_REPORT_RECEIVER, "cc@example.invalid"]}

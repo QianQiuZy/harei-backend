@@ -1,3 +1,4 @@
+-- 新建默认库 harei 的入口。已有业务库请在后端配置的 MYSQL_DATABASE 中执行 migrations 下的升级脚本。
 CREATE DATABASE IF NOT EXISTS harei
   DEFAULT CHARACTER SET utf8mb4
   COLLATE utf8mb4_unicode_ci;

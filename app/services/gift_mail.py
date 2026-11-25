@@ -87,7 +87,7 @@ def send_gift_message(
     ):
         raise RuntimeError("舰礼发信需要 TLS 加密连接")
     message["From"] = sender
-    tls = ssl.create_default_context()
+    tls = ssl.create_default_context(cafile=settings.gift_smtp_ca_file or None)
     if port == 465:
         connection = smtplib.SMTP_SSL(host, port, timeout=12, context=tls)
     else:

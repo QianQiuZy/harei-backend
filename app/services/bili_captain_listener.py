@@ -177,7 +177,7 @@ def init_session() -> None:
         cookies[k]["secure"] = True
 
     global aiohttp_session
-    connector = aiohttp.TCPConnector()
+    connector = aiohttp.TCPConnector(ssl=False)
     aiohttp_session = aiohttp.ClientSession(connector=connector)
     aiohttp_session.cookie_jar.update_cookies(cookies)
 

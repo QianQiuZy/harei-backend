@@ -60,6 +60,7 @@ def test_noreply_window_across_senders_and_cc(tmp_path, monkeypatch):
             gift_email_from=gift_mail.NOREPLY,
             gift_smtp_host="smtp.example.test",
             gift_smtp_port=465,
+            gift_smtp_ca_file="",
             gift_smtp_pass=SimpleNamespace(get_secret_value=lambda: ""),
             gift_roster_recipient="shipping@example.test",
         )

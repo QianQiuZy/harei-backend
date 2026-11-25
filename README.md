@@ -116,7 +116,7 @@ MySQL 保存业务主数据。读取热数据直接访问 Redis。修改业务�
 
 完整寄送地址仅在所属账号的个人接口和寄给配置收件人的 Excel 附件中提供。管理名单显示填写状态，单号模板只含月份、UID、昵称、原单号和寄送单号。地址附件在内存中生成。
 
-新库运行 `db.sql`。已有库在部署应用前使用数据库客户端**选中目标数据库**并依次执行 [001_member_gifts.sql](migrations/001_member_gifts.sql)、[002_binding_names_and_address_refill.sql](migrations/002_binding_names_and_address_refill.sql)、[003_member_address_autofill.sql](migrations/003_member_address_autofill.sql)、[004_returned_address.sql](migrations/004_returned_address.sql)、[005_hot_cache_fences.sql](migrations/005_hot_cache_fences.sql)、[006_live_gift_eligibility.sql](migrations/006_live_gift_eligibility.sql) 和 [007_captain_startup_backfill.sql](migrations/007_captain_startup_backfill.sql)。这些脚本均可重复执行。首次执行时记录北京时间的上线月。
+新建默认库 `harei` 时运行 `db.sql`，该文件内的 `USE harei` 会切换数据库。升级已有库时，在面板同一连接中先用 `USE` 选中后端 `MYSQL_DATABASE` 指定的库，再用 `SELECT DATABASE()` 核对库名，随后依次执行 [001_member_gifts.sql](migrations/001_member_gifts.sql)、[002_binding_names_and_address_refill.sql](migrations/002_binding_names_and_address_refill.sql)、[003_member_address_autofill.sql](migrations/003_member_address_autofill.sql)、[004_returned_address.sql](migrations/004_returned_address.sql)、[005_hot_cache_fences.sql](migrations/005_hot_cache_fences.sql)、[006_live_gift_eligibility.sql](migrations/006_live_gift_eligibility.sql) 和 [007_captain_startup_backfill.sql](migrations/007_captain_startup_backfill.sql)。这些脚本均可重复执行。首次执行时记录北京时间的上线月。
 
 从上线月起，目标房间的上舰消息按北京时间归月。实付金瓜子数大于零时立即建立该 UID 的当月资格，即使尚未设置截止日也可填写地址。零价盲盒及缺失付款金额的事件只记入上舰流水。月底 23:55 采样，31 天的月份取 30、31 日两份在舰名单的并集和各 UID 的最高档位。次月 1 日零点后合并付费与在舰资格，每个 UID 每月一份。已发货后自动升档会保留原单号并标记需人工补寄，上传新的补寄单号后解除标记。每次启动按北京时间本月读取一次 `captains.joined_month`，按 UID 合并到已有资格。迁移标记的旧版记录统一视为本房间付费上舰。新版流水保存房间号与实际单价，金额为零、缺失金额和其他房间的记录均排除在付费资格之外。
 

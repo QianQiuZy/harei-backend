@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     gift_mail_rate_redis_url: SecretStr = SecretStr("")
     gift_smtp_host: str = "gz-smtp.qcloudmail.com"
     gift_smtp_port: int = 465
+    gift_smtp_ca_file: str = ""
     gift_email_from: str = "noreply@harei.cn"
     gift_roster_recipient: Email = "harei0301@126.com"
     gift_smtp_pass: SecretStr = SecretStr("")
