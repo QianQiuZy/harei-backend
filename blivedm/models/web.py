@@ -466,7 +466,7 @@ class UserToastV2Message:
     """舰队等级，0非舰队，1总督，2提督，3舰长"""
     num: int = 0  # 可以理解为礼物数量？
     """数量"""
-    price: int = 0
+    price: Optional[int] = None
     """单价金瓜子数"""
     unit: str = ''
     """单位，根据开放平台的文档，正常单位为“月”，如为其他内容，无视`guard_num`以本字段内容为准，例如`*3天`"""
@@ -485,16 +485,16 @@ class UserToastV2Message:
     def from_command(cls, data: dict):
         sender_info = data['sender_uinfo']
         guard_info = data['guard_info']
-        pay_info = data['pay_info']
+        pay_info = data.get('pay_info') or {}
         gift_info = data['gift_info']
         option = data['option']
         return cls(
             uid=sender_info['uid'],
             username=sender_info['base']['name'],
             guard_level=guard_info['guard_level'],
-            num=pay_info['num'],
-            price=pay_info['price'],
-            unit=pay_info['unit'],
+            num=pay_info.get('num', 1),
+            price=pay_info.get('price'),
+            unit=pay_info.get('unit', ''),
             gift_id=gift_info['gift_id'],
             start_time=guard_info['start_time'],
             end_time=guard_info['end_time'],

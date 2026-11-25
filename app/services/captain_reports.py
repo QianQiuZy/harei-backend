@@ -19,7 +19,7 @@ def build_captains_workbook(rows: Sequence[Captain], month: str) -> Workbook:
     worksheet.append(headers)
 
     column_widths = [len(header) for header in headers]
-    for row in rows:
+    for row_number, row in enumerate(rows, start=2):
         joined_at = row.joined_at.strftime("%Y-%m-%d %H:%M:%S")
         values = [
             row.user_uid,
@@ -31,6 +31,8 @@ def build_captains_workbook(rows: Sequence[Captain], month: str) -> Workbook:
         ]
         worksheet.append(values)
         for index, value in enumerate(values):
+            if isinstance(value, str):
+                worksheet.cell(row_number, index + 1).data_type = "s"
             value_length = len(str(value))
             if value_length > column_widths[index]:
                 column_widths[index] = value_length

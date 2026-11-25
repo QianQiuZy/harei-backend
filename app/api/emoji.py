@@ -23,13 +23,14 @@ def list_emojis() -> EmojiGroupsResponse:
     group_icons: dict[str, str] = {}
     if EMOJI_ROOT.is_dir():
         for group_path in sorted(EMOJI_ROOT.iterdir(), key=lambda path: path.name.casefold()):
-            if not group_path.is_dir():
+            if not group_path.is_dir() or EMOJI_ROOT.resolve() not in group_path.resolve().parents:
                 continue
             image_paths = sorted(
                 (
                     image_path
                     for image_path in group_path.iterdir()
                     if image_path.is_file() and image_path.suffix.lower() in IMAGE_SUFFIXES
+                    and group_path.resolve() in image_path.resolve().parents
                 ),
                 key=lambda path: path.name.casefold(),
             )
@@ -101,6 +102,7 @@ def get_emoji(group_name: str, emoji_name: str) -> FileResponse:
             path
             for path in group_dir.iterdir()
             if path.is_file()
+            and group_dir in path.resolve().parents
             and path.stem == emoji_name
             and path.suffix.lower() in IMAGE_SUFFIXES
         ),

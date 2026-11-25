@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import logging
+import re
+from io import BytesIO
+from tempfile import NamedTemporaryFile
 from pathlib import Path
 
 from anyio import to_thread
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from PIL import Image as PilImage, UnidentifiedImageError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.hot_cache import public_cache, public_fence
 from app.db.session import get_db_session
 from app.deps.auth import require_admin
 from app.models.captain_gift_archive import CaptainGiftArchive
@@ -27,21 +31,23 @@ async def require_token(
 
 
 def _process_captaingift_image(raw_bytes: bytes, target_path: Path) -> None:
-    temp_path = target_path.with_suffix(".upload")
-
+    temp_path = None
     try:
-        _ = temp_path.write_bytes(raw_bytes)
-        with PilImage.open(temp_path) as img:
-            rgb_image = img.convert("RGB")
-            rgb_image.save(target_path, format="JPEG", quality=90, optimize=True)
-    except (UnidentifiedImageError, OSError) as exc:
-        _ = target_path.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid image",
-        ) from exc
+        with PilImage.open(BytesIO(raw_bytes)) as img:
+            if PilImage.MAX_IMAGE_PIXELS and img.width * img.height > PilImage.MAX_IMAGE_PIXELS:
+                raise HTTPException(status_code=413, detail="Image dimensions too large")
+            with NamedTemporaryFile(dir=target_path.parent, suffix=".tmp", delete=False) as output:
+                temp_path = Path(output.name)
+                with img.convert("RGB") as rgb:
+                    rgb.save(output, format="JPEG", quality=90, optimize=True)
+        temp_path.replace(target_path)
+    except PilImage.DecompressionBombError as exc:
+        raise HTTPException(status_code=413, detail="Image dimensions too large") from exc
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid image") from exc
     finally:
-        _ = temp_path.unlink(missing_ok=True)
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def _resolve_gift_path(path: str, *, require_file: bool = True) -> Path:
@@ -56,11 +62,15 @@ def _resolve_gift_path(path: str, *, require_file: bool = True) -> Path:
 
 
 @router.get("", response_model=CaptainGiftListResponse)
+@public_cache("archives")
 async def list_captaingifts(
     session: AsyncSession = Depends(get_db_session),
 ) -> CaptainGiftListResponse:
+    latest = select(func.max(CaptainGiftArchive.id)).group_by(CaptainGiftArchive.gift_month)
     result = await session.execute(
-        select(CaptainGiftArchive).order_by(CaptainGiftArchive.gift_month.desc())
+        select(CaptainGiftArchive)
+        .where(CaptainGiftArchive.id.in_(latest))
+        .order_by(CaptainGiftArchive.gift_month.desc())
     )
     rows = result.scalars().all()
     return CaptainGiftListResponse.from_rows(rows)
@@ -71,7 +81,9 @@ async def download_captaingift_image(
     path: str,
 ) -> FileResponse:
     file_path = _resolve_gift_path(path)
-    return FileResponse(file_path)
+    if file_path.suffix.lower() not in {".jpg", ".jpeg"}:
+        raise HTTPException(404, "Not found")
+    return FileResponse(file_path, media_type="image/jpeg", headers={"X-Content-Type-Options": "nosniff"})
 
 
 @router.post("/add")
@@ -81,33 +93,43 @@ async def upload_captaingift(
     session: AsyncSession = Depends(get_db_session),
     _: None = Depends(require_token),
 ) -> dict[str, int | str]:
-    if not month.isdigit() or len(month) != 6:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid month")
+    if not re.fullmatch(r"[0-9]{4}(?:0[1-9]|1[0-2])", month):
+        raise HTTPException(status_code=400, detail="Invalid month")
 
     raw_bytes = await file.read()
     CAPTAIN_GIFT_DIR.mkdir(parents=True, exist_ok=True)
     target_path = build_captaingift_path(month, raw_bytes)
+    await public_fence(session, "archives", write=True)
     await to_thread.run_sync(_process_captaingift_image, raw_bytes, target_path)
 
     result = await session.execute(
         select(CaptainGiftArchive).where(CaptainGiftArchive.gift_month == month)
     )
-    existing = result.scalar_one_or_none()
-    previous_path: Path | None = None
-    if existing:
-        previous_path = _resolve_gift_path(existing.image_path, require_file=False)
-        existing.image_path = str(target_path)
+    rows = result.scalars().all()
+    previous_paths = {_resolve_gift_path(row.image_path, require_file=False) for row in rows}
+    if rows:
+        for row in rows:
+            row.image_path = str(target_path)
     else:
         session.add(CaptainGiftArchive(gift_month=month, image_path=str(target_path)))
     await session.commit()
-
-    if previous_path is not None and previous_path != target_path.resolve():
-        try:
-            _ = previous_path.unlink(missing_ok=True)
-        except OSError as exc:
-            logger.warning("旧舰礼图片清理失败 path=%s error=%s", previous_path, exc)
+    await _remove_replaced_images(session, previous_paths - {target_path.resolve()})
 
     return {"code": 0, "message": f"{month}已上传"}
+
+
+async def _remove_replaced_images(session: AsyncSession, paths: set[Path]) -> None:
+    if not paths:
+        return
+    # A later upload may have reselected a hash, or a legacy row may share its file.
+    await public_fence(session, "archives", write=True)
+    current = await session.scalars(select(CaptainGiftArchive.image_path))
+    paths.difference_update(Path(saved).resolve() for saved in current)
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("舰礼图片清理失败 path=%s error=%s", path, exc)
 
 
 @router.post("/delete")
@@ -116,24 +138,22 @@ async def delete_captaingift(
     session: AsyncSession = Depends(get_db_session),
     _: None = Depends(require_token),
 ) -> dict[str, int | str]:
+    await public_fence(session, "archives", write=True)
     month = payload.month
-    if not month.isdigit() or len(month) != 6:
+    if not re.fullmatch(r"[0-9]{4}(?:0[1-9]|1[0-2])", month):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid month")
 
     result = await session.execute(
         select(CaptainGiftArchive).where(CaptainGiftArchive.gift_month == month)
     )
-    existing = result.scalar_one_or_none()
-    if not existing:
+    rows = result.scalars().all()
+    if not rows:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
 
-    file_path = _resolve_gift_path(existing.image_path, require_file=False)
-    await session.delete(existing)
+    paths = {_resolve_gift_path(row.image_path, require_file=False) for row in rows}
+    for row in rows:
+        await session.delete(row)
     await session.commit()
-
-    try:
-        _ = file_path.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.warning("舰礼图片删除失败 path=%s error=%s", file_path, exc)
+    await _remove_replaced_images(session, paths)
 
     return {"code": 0, "message": f"{month}已删除"}

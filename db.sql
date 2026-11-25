@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS captains (
   level ENUM('舰长', '提督', '总督') NOT NULL,
   ship_count INT NOT NULL DEFAULT 1,
   is_red_packet TINYINT(1) NOT NULL DEFAULT 0,
+  room_id BIGINT NULL,
+  paid_price BIGINT NULL,
+  legacy_assumed_paid BOOL NOT NULL DEFAULT FALSE,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_captains_uid (user_uid),
   INDEX idx_captains_month_level (joined_month, level),
@@ -96,3 +99,129 @@ CREATE TABLE IF NOT EXISTS song_performances (
 CREATE TABLE IF NOT EXISTS music_catalog_revision (id INT PRIMARY KEY, revision INT NOT NULL DEFAULT 0, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 INSERT IGNORE INTO music_catalog_revision (id, revision) VALUES (1, 0);
 CREATE TABLE IF NOT EXISTS music_audit_events (audit_id INT AUTO_INCREMENT PRIMARY KEY, actor VARCHAR(255) NOT NULL, action VARCHAR(80) NOT NULL, entity_type VARCHAR(40) NOT NULL, entity_id VARCHAR(100) NOT NULL, details JSON NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_music_audit_created (created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS gift_months (
+	room_id INTEGER NOT NULL,
+	month VARCHAR(6) NOT NULL,
+	settled BOOL NOT NULL,
+	roster_finalized_at DATETIME,
+	deadline DATETIME,
+	reminded BOOL NOT NULL,
+	revision INTEGER NOT NULL,
+	PRIMARY KEY (room_id, month)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS gift_purchase_levels (
+	room_id INTEGER NOT NULL,
+	month VARCHAR(6) NOT NULL,
+	uid VARCHAR(20) NOT NULL,
+	level INTEGER NOT NULL,
+	paid_level INTEGER,
+	applied_level INTEGER,
+	nickname VARCHAR(255),
+	INDEX ix_gift_purchase_pending (room_id, applied_level, month),
+	PRIMARY KEY (room_id, month, uid)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS gift_system (
+	id INTEGER NOT NULL,
+	first_month VARCHAR(6) NOT NULL,
+	PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS member_accounts (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	email VARCHAR(254),
+	password_hash VARCHAR(255),
+	address TEXT,
+	auto_fill_address BOOL NOT NULL DEFAULT TRUE,
+	session_version INTEGER NOT NULL,
+	PRIMARY KEY (id),
+	UNIQUE (email)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS member_appeals (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	ticket VARCHAR(64) NOT NULL,
+	contact VARCHAR(254) NOT NULL,
+	uid VARCHAR(20),
+	message TEXT NOT NULL,
+	reply TEXT,
+	created_at DATETIME NOT NULL,
+	closed BOOL NOT NULL,
+	PRIMARY KEY (id),
+	UNIQUE (ticket)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS member_gift_audit (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	created_at DATETIME NOT NULL,
+	actor VARCHAR(128) NOT NULL,
+	action VARCHAR(40) NOT NULL,
+	subject VARCHAR(100) NOT NULL,
+	details JSON NOT NULL,
+	PRIMARY KEY (id),
+	INDEX ix_member_gift_audit_subject (subject)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS member_gift_mail (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	month VARCHAR(6) NOT NULL,
+	member_id INTEGER NOT NULL,
+	revision INTEGER NOT NULL,
+	kind VARCHAR(16) NOT NULL,
+	uids JSON NOT NULL,
+	deadline DATETIME NOT NULL,
+	attempts INTEGER NOT NULL,
+	next_try DATETIME NOT NULL,
+	sent BOOL NOT NULL,
+	PRIMARY KEY (id),
+	CONSTRAINT uq_gift_mail_revision UNIQUE (month, member_id, revision),
+	FOREIGN KEY(member_id) REFERENCES member_accounts (id),
+	INDEX ix_member_gift_mail_next_try (next_try)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS member_gifts (
+	room_id INTEGER NOT NULL,
+	month VARCHAR(6) NOT NULL,
+	uid VARCHAR(20) NOT NULL,
+	nickname VARCHAR(255) NOT NULL,
+	bound_username VARCHAR(255),
+	roster_level INTEGER,
+	needs_reship BOOL NOT NULL DEFAULT FALSE,
+	level INTEGER NOT NULL,
+	state VARCHAR(16) NOT NULL,
+	owner_id INTEGER,
+	waived_by INTEGER,
+	grace_until DATETIME,
+	extension_until DATETIME,
+	refill_requested BOOL NOT NULL DEFAULT FALSE,
+	returned_address TEXT,
+	frozen_at DATETIME,
+	address TEXT,
+	tracking VARCHAR(100),
+	manual_level BOOL NOT NULL,
+	PRIMARY KEY (room_id, month, uid),
+	FOREIGN KEY(room_id, month) REFERENCES gift_months (room_id, month),
+	FOREIGN KEY(owner_id) REFERENCES member_accounts (id),
+	FOREIGN KEY(waived_by) REFERENCES member_accounts (id),
+	INDEX ix_member_gifts_owner_id (owner_id),
+	INDEX ix_member_gifts_state (state),
+	INDEX ix_member_gifts_uid (uid)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS member_uid_bindings (
+	uid VARCHAR(20) NOT NULL,
+	username VARCHAR(255),
+	member_id INTEGER NOT NULL,
+	address TEXT,
+	PRIMARY KEY (uid),
+	FOREIGN KEY(member_id) REFERENCES member_accounts (id),
+	INDEX ix_member_uid_bindings_member_id (member_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO gift_system (id, first_month) VALUES (1, DATE_FORMAT(UTC_TIMESTAMP() + INTERVAL 8 HOUR, '%Y%m'));
+CREATE TABLE IF NOT EXISTS hot_cache_fences (
+    name VARCHAR(32) NOT NULL PRIMARY KEY
+) ENGINE=InnoDB;
+INSERT IGNORE INTO hot_cache_fences (name) VALUES ('music'), ('tags'), ('downloads'), ('archives');

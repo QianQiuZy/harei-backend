@@ -2,6 +2,7 @@ import secrets
 import json
 from datetime import UTC, datetime, timedelta
 
+from anyio import CapacityLimiter, to_thread
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from redis.asyncio import Redis
@@ -10,6 +11,11 @@ from app.core.config import get_settings
 from app.schemas.auth import SessionPrincipal
 
 password_hasher = PasswordHasher()
+admin_hash_limiter = CapacityLimiter(2)
+
+
+async def verify_admin_password(check, username, password):
+    return await to_thread.run_sync(check, username, password, limiter=admin_hash_limiter)
 
 
 class AuthService:

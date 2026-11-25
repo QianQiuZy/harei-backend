@@ -1,11 +1,14 @@
 from dataclasses import dataclass
+from contextlib import closing
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from io import BytesIO
 from typing import Final, Protocol, TypeAlias
 from urllib.parse import urlsplit
-from zipfile import BadZipFile
+from xml.etree.ElementTree import ParseError
+from zipfile import BadZipFile, ZipFile
 
+from defusedxml.common import DefusedXmlException
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell.rich_text import CellRichText
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -78,8 +81,12 @@ def build_performance_template(songs: list[Song]) -> BytesIO:
 
     song_sheet = _create_sheet(workbook, SONG_LIST_SHEET)
     song_sheet.append(("歌名", "歌手", "状态"))
-    for song in songs:
+    for row_number, song in enumerate(songs, start=2):
         song_sheet.append((song.title, song.artist, "公开" if song.status == "active" else "归档"))
+        for column in (1, 2):
+            cell = song_sheet.cell(row_number, column)
+            if cell.value is not None:
+                cell.data_type = "s"
     song_sheet.freeze_panes = "A2"
     song_sheet.auto_filter.ref = f"A1:C{max(song_sheet.max_row, 1)}"
     _style_header(song_sheet)
@@ -93,14 +100,22 @@ def build_performance_template(songs: list[Song]) -> BytesIO:
 
 def parse_performance_workbook(contents: bytes) -> tuple[list[PerformanceImportRow], list[WorkbookIssue]]:
     try:
-        workbook = load_workbook(BytesIO(contents), read_only=True, data_only=True)
-    except (BadZipFile, OSError, ValueError, KeyError) as exc:
-        return [], [WorkbookIssue(1, "file", "INVALID_XLSX", f"无法读取 XLSX：{exc}")]
+        with ZipFile(BytesIO(contents)) as archive:
+            if sum(entry.file_size for entry in archive.infolist()) > 32 * 1024 * 1024:
+                return [], [WorkbookIssue(1, "file", "TOO_LARGE", "表格解压后过大，请分批上传")]
+        with closing(load_workbook(BytesIO(contents), read_only=True, data_only=True, keep_links=False)) as workbook:
+            if IMPORT_SHEET not in workbook.sheetnames:
+                return [], [WorkbookIssue(1, "sheet", "MISSING_SHEET", f"缺少工作表“{IMPORT_SHEET}”")]
+            return _parse_sheet(workbook[IMPORT_SHEET])
+    except (BadZipFile, OSError, ValueError, KeyError, ParseError, DefusedXmlException):
+        return [], [WorkbookIssue(1, "file", "INVALID_XLSX", "无法读取 XLSX，请检查文件")]
 
-    if IMPORT_SHEET not in workbook.sheetnames:
-        return [], [WorkbookIssue(1, "sheet", "MISSING_SHEET", f"缺少工作表“{IMPORT_SHEET}”")]
-    sheet = workbook[IMPORT_SHEET]
-    values = sheet.iter_rows(values_only=True)
+
+def _parse_sheet(sheet) -> tuple[list[PerformanceImportRow], list[WorkbookIssue]]:
+    if (sheet.max_column or 0) > len(IMPORT_HEADERS) or (sheet.max_row or 0) > 50001:
+        return [], [WorkbookIssue(1, "sheet", "INVALID_SIZE", "模板列数不正确或超过 5 万条，请分批上传")]
+    sheet.reset_dimensions()
+    values = sheet.iter_rows(max_col=len(IMPORT_HEADERS), values_only=True)
     header = next(values, None)
     if tuple(header or ()) != IMPORT_HEADERS:
         return [], [WorkbookIssue(1, "header", "INVALID_HEADERS", "表头必须依次为：歌名、日期、直播标题、歌切链接")]
@@ -109,6 +124,8 @@ def parse_performance_workbook(contents: bytes) -> tuple[list[PerformanceImportR
     issues: list[WorkbookIssue] = []
     seen: set[tuple[str, date, str]] = set()
     for excel_row, raw in enumerate(values, start=2):
+        if excel_row > 50001:
+            return [], [WorkbookIssue(1, "sheet", "INVALID_SIZE", "超过 5 万条，请分批上传")]
         if not raw or all(value is None or value == "" for value in raw):
             continue
         title = _required_text(raw[0] if len(raw) > 0 else None)

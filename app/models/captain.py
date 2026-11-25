@@ -1,6 +1,15 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, Index, Integer, String, TIMESTAMP
+from sqlalchemy import (
+    TIMESTAMP,
+    BigInteger,
+    Boolean,
+    DateTime,
+    Enum,
+    Index,
+    Integer,
+    String,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -21,6 +30,9 @@ class Captain(Base):
     )
     ship_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
     is_red_packet: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="0")
+    room_id: Mapped[int | None] = mapped_column(BigInteger)
+    paid_price: Mapped[int | None] = mapped_column(BigInteger)
+    legacy_assumed_paid: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP,
         nullable=False,

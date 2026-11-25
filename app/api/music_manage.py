@@ -6,13 +6,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.music import _performance, _summary
 from app.core.config import get_settings
+from app.core.rate_limit import admin_login_budget
 from app.core.redis import get_redis_client
 from app.db.session import get_db_session
 from app.deps.auth import Principal, require_music_manage
 from app.models.music import MusicAuditEvent, MusicCatalogRevision, Song, SongPerformance
 from app.schemas.auth import LoginRequest, LoginResponse, UserInfo
 from app.schemas.music import AuditOut, PerformanceInput, SongInput, SongUpdate, VersionInput
-from app.services.auth_service import AuthService
+from app.services.auth_service import AuthService, verify_admin_password
 from app.services.music_identifiers import generate_music_source_key
 
 router = APIRouter(prefix="/music-manage")
@@ -29,16 +30,18 @@ async def _song_or_404(session: AsyncSession, song_id: int) -> Song:
     return song
 
 @router.post("/login", response_model=LoginResponse)
-async def login(payload: LoginRequest, redis: Redis = Depends(get_redis_client)) -> LoginResponse:
+async def login(payload: LoginRequest, budget=Depends(admin_login_budget), redis: Redis = Depends(get_redis_client)) -> LoginResponse:
     service = AuthService(redis)
-    if service.verify_credentials(payload.username, payload.password):
+    if await verify_admin_password(service.verify_credentials, payload.username, payload.password):
         scopes = ["admin", "music:manage"]
         ttl_seconds = None  # Main accounts retain the normal admin token lifetime.
-    elif service.verify_music_credentials(payload.username, payload.password):
+    elif await verify_admin_password(service.verify_music_credentials, payload.username, payload.password):
         scopes = ["music:manage"]
         ttl_seconds = get_settings().music_token_ttl_seconds
     else:
+        await budget(failure=True)
         raise HTTPException(status_code=401, detail="Unauthorized")
+    await budget()
     token, principal = await service.issue_token(payload.username, scopes, ttl_seconds)
     return LoginResponse(token=token, user=UserInfo(username=payload.username), scopes=principal.scopes, expires_at=principal.expires_at)
 

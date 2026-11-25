@@ -1,20 +1,22 @@
 from __future__ import annotations
 
+from asyncio import to_thread
+from contextlib import ExitStack
 from pathlib import Path
+from shutil import copyfileobj
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from starlette.datastructures import UploadFile
 from fastapi.responses import FileResponse
-from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.redis import get_redis_client
+from app.services.hot_cache import public_cache
 from app.db.session import get_db_session
 from app.deps.auth import require_admin
 from app.models.download import Download
 from app.schemas.download import DownloadAddResponse, DownloadListResponse
-from app.services.auth_service import AuthService
 
 router = APIRouter(prefix="/download")
 
@@ -43,8 +45,8 @@ def _resolve_download_path(path: str) -> Path:
 
 
 @router.get("/active", response_model=DownloadListResponse)
+@public_cache("downloads")
 async def list_active(
-    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ) -> DownloadListResponse:
     result = await session.execute(select(Download).order_by(Download.download_id.desc()))
@@ -55,7 +57,7 @@ async def list_active(
             "description": row.description,
             "path": row.path
             if _is_external_path(row.path)
-            else f"{request.url_for('download_file')}?download_id={row.download_id}",
+            else f"/download/file?download_id={row.download_id}",
         }
         for row in rows
     ]
@@ -73,7 +75,10 @@ async def download_file(
     if _is_external_path(row.path):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="External path not allowed")
     file_path = _resolve_download_path(row.path)
-    return FileResponse(file_path)
+    return FileResponse(
+        file_path, filename=file_path.name,
+        headers={"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox; default-src 'none'"},
+    )
 
 
 @router.post("/add", response_model=DownloadAddResponse)
@@ -82,23 +87,33 @@ async def add_download(
     session: AsyncSession = Depends(get_db_session),
     _: None = Depends(require_token),
 ) -> DownloadAddResponse:
-    content_type = request.headers.get("content-type", "")
-    description = ""
-    download_path = ""
-    upload_file: UploadFile | None = None
+    content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+    if content_type == "application/json":
+        try:
+            payload = await request.json()
+        except (ValueError, RecursionError) as exc:
+            raise HTTPException(422, detail="Invalid JSON object") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(422, detail="Expected a JSON object")
+        return await _save_download(session, payload.get("description", ""), payload.get("path", ""))
 
-    if "application/json" in content_type:
-        payload = await request.json()
-        description = str(payload.get("description") or "").strip()
-        download_path = str(payload.get("path") or "").strip()
-    else:
-        form = await request.form()
-        description = str(form.get("description") or "").strip()
-        download_path = str(form.get("path") or "").strip()
-        file_value = form.get("file")
-        if isinstance(file_value, UploadFile):
-            upload_file = file_value
+    async with request.form() as form:
+        upload = form.get("file")
+        return await _save_download(
+            session, form.get("description", ""), form.get("path", ""),
+            upload if isinstance(upload, UploadFile) else None,
+        )
 
+
+async def _save_download(
+    session: AsyncSession, description: object, download_path: object, upload_file: UploadFile | None = None,
+) -> DownloadAddResponse:
+    if not isinstance(description, str) or not isinstance(download_path, str):
+        raise HTTPException(422, detail="Expected text for description and path")
+    description = description.strip()
+    download_path = download_path.strip()
+    if len(description) > 255 or len(download_path) > 1024:
+        raise HTTPException(422, detail="Description or path too long")
     missing_fields: list[str] = []
     if not description:
         missing_fields.append("description")
@@ -115,17 +130,22 @@ async def add_download(
             detail="Only one of path or file is allowed",
         )
 
-    if upload_file is not None:
-        DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
-        file_suffix = Path(upload_file.filename or "").suffix.lower() or ".bin"
-        file_id = uuid4().hex
-        file_path = DOWNLOAD_ROOT / f"{file_id}{file_suffix}"
-        raw_bytes = await upload_file.read()
-        file_path.write_bytes(raw_bytes)
-        download_path = str(file_path)
+    with ExitStack() as uncommitted_files:
+        if upload_file is not None:
+            DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+            suffix = Path(upload_file.filename or "").suffix.lower()
+            if not suffix or len(suffix.encode()) > 223 or "\x00" in suffix:
+                suffix = ".bin"
+            file_path = DOWNLOAD_ROOT / f"{uuid4().hex}{suffix}"
+            with file_path.open("xb") as target:
+                uncommitted_files.callback(file_path.unlink, missing_ok=True)
+                await to_thread(copyfileobj, upload_file.file, target, 1024 * 1024)
+            download_path = str(file_path)
 
-    row = Download(description=description, path=download_path)
-    session.add(row)
-    await session.flush()
+        row = Download(description=description, path=download_path)
+        session.add(row)
+        await session.flush()
+        # Once COMMIT starts its acknowledgement can be lost even if the row was saved.
+        uncommitted_files.pop_all()
     await session.commit()
     return DownloadAddResponse(download_id=row.download_id, path=row.path)

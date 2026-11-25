@@ -208,12 +208,12 @@ async def test_total_changes_trigger_full_refetch(listener, monkeypatch):
 async def test_day30_redis_then_day31_union_and_restart(listener, monkeypatch):
     target = dt.datetime(2026, 10, 30, 23, 55)
     monkeypatch.setattr(listener, "_now", lambda: target)
-    listener._collect_guard_rows = AsyncMock(return_value=[row(1), row(2)])
+    listener._collect_guard_rows = AsyncMock(return_value=[row(1), row(2, level="提督")])
     assert await listener._snapshot_guard_report(target) is None
     assert not listener._guard_snapshot_path("202610").exists()
     assert listener.test_redis.ttls[listener._guard_cache_key("202610", "day30")] == 90 * 86400
     target = dt.datetime(2026, 10, 31, 23, 55)
-    listener._collect_guard_rows.return_value = [row(2, "renamed", "提督"), row(3)]
+    listener._collect_guard_rows.return_value = [row(2, "renamed", "舰长"), row(3)]
     path = await listener._snapshot_guard_report(target)
     assert path.exists()
     assert listener._read_guard_snapshot("202610") == [row(1), row(2, "renamed", "提督"), row(3)]
@@ -270,7 +270,7 @@ async def test_restart_reuses_completed_snapshot_without_refetch(listener, monke
 
 
 def event(listener, when, uid=7, level="舰长"):
-    return listener.CaptainEvent(str(uid), f"event{uid}", level, 1, False, when)
+    return listener.CaptainEvent(str(uid), f"event{uid}", level, 1, False, when, paid_price=198000)
 
 
 @pytest.mark.asyncio
@@ -446,13 +446,16 @@ async def test_handler_captures_late_event_even_if_db_queue_is_full(listener, mo
     monkeypatch.setattr(listener, "_now", lambda: dt.datetime(2026, 11, 30, 23, 59))
     listener.CAPTAIN_QUEUE = asyncio.Queue(maxsize=1)
     listener.CAPTAIN_QUEUE.put_nowait("already full")
-    message = types.SimpleNamespace(uid=7, username="event7", guard_level=3, num=1, price=0)
+    message = types.SimpleNamespace(uid=7, username="event7", guard_level=3, num=1, price=198000)
     client = types.SimpleNamespace(room_id=listener.GUARD_REPORT_ROOM_ID)
     listener.MyHandler()._on_user_toast_v2(client, message)
     await asyncio.gather(*list(listener.GUARD_EVENT_TASKS))
     assert await listener._late_guard_rows("202611") == [row(7, "event7")]
     assert listener.CAPTAIN_QUEUE.qsize() == 1
     listener.CAPTAIN_QUEUE.get_nowait()
+    listener.CAPTAIN_QUEUE.task_done()
+    await asyncio.gather(*list(listener.CAPTAIN_ENQUEUE_TASKS))
+    assert listener.CAPTAIN_QUEUE.get_nowait().paid_price == 198000
     listener.CAPTAIN_QUEUE.task_done()
 
 
@@ -480,9 +483,10 @@ async def test_failed_email_is_not_marked_sent(listener):
 def test_smtp_message_counts_attachments_and_cc(listener, monkeypatch):
     from email import policy
     from email.parser import Parser
+    from pydantic import SecretStr
 
-    settings = types.SimpleNamespace(smtp_host="smtp.example.invalid", smtp_port=465,
-                                     smtp_user="", smtp_pass="", email_from="from@example.invalid",
+    settings = types.SimpleNamespace(gift_smtp_host="smtp.example.invalid", gift_smtp_port=465,
+                                     gift_smtp_pass=SecretStr("test-only"), gift_email_from="from@example.invalid",
                                      email_cc_list=["cc@example.invalid"])
     monkeypatch.setattr(listener, "get_settings", lambda: settings)
     server = Mock()
@@ -493,10 +497,13 @@ def test_smtp_message_counts_attachments_and_cc(listener, monkeypatch):
     guard = listener._build_guard_report_xlsx([row(1), row(2)], "202611")
     captain = listener.save_captains_xlsx([], "202611", listener.GUARD_REPORT_ROOT)
     listener.original_send_guard_report_email(guard, captain, "202611", 2, 0)
-    sender, receivers, text = server.sendmail.call_args.args
-    assert sender == settings.email_from
-    assert receivers == [listener.GUARD_REPORT_RECEIVER, "cc@example.invalid"]
-    msg = Parser(policy=policy.default).parsestr(text)
+    listener.smtplib.SMTP_SSL.assert_called_once()
+    assert listener.smtplib.SMTP_SSL.call_args.args == (settings.gift_smtp_host, 465)
+    server.login.assert_called_once_with(settings.gift_email_from, "test-only")
+    envelope = server.send_message.call_args
+    assert envelope.kwargs == {"from_addr": settings.gift_email_from, "to_addrs": [listener.GUARD_REPORT_RECEIVER, "cc@example.invalid"]}
+    msg = Parser(policy=policy.default).parsestr(envelope.args[0].as_string())
+    assert str(msg["From"]) == settings.gift_email_from
     assert "在舰列表人数：2 人" in msg.get_body().get_content()
     assert "上舰记录数量：0 条" in msg.get_body().get_content()
     attachments = list(msg.iter_attachments())
@@ -506,7 +513,7 @@ def test_smtp_message_counts_attachments_and_cc(listener, monkeypatch):
 
 
 def test_unconfigured_smtp_is_failure(listener, monkeypatch):
-    monkeypatch.setattr(listener, "get_settings", lambda: types.SimpleNamespace(smtp_host="", email_from=""))
+    monkeypatch.setattr(listener, "get_settings", lambda: types.SimpleNamespace(gift_smtp_host="", gift_email_from=""))
     with pytest.raises(listener.GuardSnapshotError, match="未发送"):
         listener.original_send_guard_report_email(Path("unused"), Path("unused"), "202611", 0, 0)
 
@@ -540,3 +547,16 @@ async def test_real_redis_snapshot_and_event_roundtrip(listener, tmp_path):
         await redis.aclose()
         process.terminate()
         process.wait(timeout=5)
+
+
+def test_guard_and_captain_spreadsheets_store_nicknames_as_text(listener):
+    from openpyxl import load_workbook
+    from app.services.captain_reports import build_captains_workbook
+
+    nickname = "=1+1"
+    guard_path = listener._build_guard_report_xlsx([{"uid": "123", "name": nickname, "level": "舰长"}], "202611")
+    captain = types.SimpleNamespace(user_uid="123", username=nickname, level="舰长", ship_count=1,
+                                    joined_at=dt.datetime(2026, 11, 1), is_red_packet=False)
+    for book in (load_workbook(guard_path), build_captains_workbook([captain], "202611")):
+        assert book.active["B2"].value == nickname and book.active["B2"].data_type == "s"
+        book.close()

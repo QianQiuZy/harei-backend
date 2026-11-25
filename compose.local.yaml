@@ -1,0 +1,102 @@
+name: harei-local
+
+services:
+  prepare:
+    image: harei-local-backend
+    pull_policy: never
+    network_mode: none
+    entrypoint: ["python", "-m", "docker.local_db"]
+    volumes:
+      - ./.env:/srv/harei/.env:ro
+      - ./docker/local_db.py:/srv/harei/docker/local_db.py:ro
+      - ./db.sql:/schema-source.sql:ro
+      - ./migrations:/schema-upgrades:ro
+      - db-config:/db-config
+  mysql:
+    image: mysql:8.4.13
+    restart: unless-stopped
+    depends_on:
+      prepare: {condition: service_completed_successfully}
+    environment:
+      MYSQL_DATABASE_FILE: /db-config/database
+      MYSQL_USER_FILE: /db-config/user
+      MYSQL_PASSWORD_FILE: /db-config/password
+      MYSQL_ROOT_PASSWORD_FILE: /db-config/root-password
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:6555:6555"
+    volumes:
+      - db-config:/db-config:ro
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+  schema:
+    image: mysql:8.4.13
+    network_mode: service:mysql
+    depends_on:
+      mysql: {condition: service_healthy}
+    volumes:
+      - db-config:/db-config:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        export MYSQL_PWD="$$(cat /db-config/password)"
+        mysql --protocol=TCP --host=127.0.0.1 --user="$$(cat /db-config/user)" --database="$$(cat /db-config/database)" < /db-config/schema.sql
+  redis:
+    image: redis:8.0.5
+    network_mode: service:mysql
+    restart: unless-stopped
+    command: ["redis-server", "--bind", "127.0.0.1", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  backend:
+    image: harei-local-backend
+    pull_policy: never
+    network_mode: service:mysql
+    restart: unless-stopped
+    depends_on:
+      schema: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+    environment:
+      MEMBER_SITE_URL: http://localhost:3000
+    volumes:
+      - ./.env:/srv/harei/.env:ro
+      - uploads:/srv/harei/uploads
+      - reports:/srv/harei/download_files
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6555/live/status', timeout=3).close()"]
+      interval: 5s
+      timeout: 4s
+      retries: 30
+  frontend:
+    image: harei-local-frontend
+    pull_policy: never
+    network_mode: service:mysql
+    restart: unless-stopped
+    depends_on:
+      backend: {condition: service_healthy}
+    volumes:
+      - ../harei-frontend/.env:/srv/harei/.env:ro
+      - ../harei-frontend/app:/srv/harei/app:ro
+      - ../harei-frontend/components:/srv/harei/components:ro
+      - ../harei-frontend/lib:/srv/harei/lib:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/account/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  db-config:
+  mysql-data:
+  redis-data:
+  uploads:
+  reports:

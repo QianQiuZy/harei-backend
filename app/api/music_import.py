@@ -1,4 +1,5 @@
 from collections import Counter, defaultdict
+from asyncio import to_thread
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
@@ -45,7 +46,7 @@ async def import_performances(
     contents = await file.read(MAX_IMPORT_BYTES + 1)
     if len(contents) > MAX_IMPORT_BYTES:
         raise HTTPException(status_code=413, detail={"error": "file_too_large", "max_bytes": MAX_IMPORT_BYTES})
-    rows, issues = parse_performance_workbook(contents)
+    rows, issues = await to_thread(parse_performance_workbook, contents)
     if issues:
         raise _validation_error(issues)
 

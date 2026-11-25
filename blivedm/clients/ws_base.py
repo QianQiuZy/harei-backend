@@ -19,6 +19,8 @@ USER_AGENT = (
 )
 
 HEADER_STRUCT = struct.Struct('>I2H2I')
+MAX_DECODED_BYTES = 16 * 1024 * 1024
+MAX_COMPRESSION_DEPTH = 2
 
 
 class HeaderTuple(NamedTuple):
@@ -77,6 +79,22 @@ class AuthError(Exception):
 
 
 DEFAULT_RECONNECT_POLICY = utils.make_constant_retry_policy(1)
+
+
+def _decode_batch(version: int, data: bytes, budget: int) -> bytes:
+    if budget <= 0:
+        raise ValueError('WebSocket message exceeds decoding budget')
+    if version == ProtoVer.BROTLI:
+        decoder = brotli.Decompressor()
+        result = decoder.process(data, budget + 1)
+        complete = decoder.is_finished()
+    else:
+        decoder = zlib.decompressobj()
+        result = decoder.decompress(data, budget + 1)
+        complete = decoder.eof
+    if len(result) > budget or not complete:
+        raise ValueError('Invalid or oversized compressed WebSocket message')
+    return result
 
 
 class WebSocketClientBase:
@@ -281,7 +299,9 @@ class WebSocketClientBase:
                         # 至少成功处理1条消息
                         retry_count = 0
 
-            except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+            except InitError:
+                logger.warning('room=%s initialization incomplete, waiting before retry', self.room_id)
+            except (aiohttp.ClientError, asyncio.TimeoutError):
                 # 掉线重连
                 pass
             except AuthError:
@@ -299,7 +319,10 @@ class WebSocketClientBase:
                 'room=%d is reconnecting, retry_count=%d, total_retry_count=%d',
                 self.room_id, retry_count, total_retry_count
             )
-            await asyncio.sleep(self._get_reconnect_interval(retry_count, total_retry_count))
+            delay = self._get_reconnect_interval(retry_count, total_retry_count)
+            if self._need_init_room:
+                delay = max(delay, min(300, 5 * 2 ** min(retry_count - 1, 6)))
+            await asyncio.sleep(delay)
 
     async def _on_before_ws_connect(self, retry_count):
         """
@@ -375,8 +398,7 @@ class WebSocketClientBase:
         :param message: WebSocket消息
         """
         if message.type != aiohttp.WSMsgType.BINARY:
-            logger.warning('room=%d unknown websocket message type=%s, data=%s', self.room_id,
-                           message.type, message.data)
+            logger.warning('room=%d unknown websocket message type=%s', self.room_id, message.type)
             return
 
         try:
@@ -387,94 +409,40 @@ class WebSocketClientBase:
         except Exception:  # noqa
             logger.exception('room=%d _parse_ws_message() error:', self.room_id)
 
-    async def _parse_ws_message(self, data: bytes):
-        """
-        解析WebSocket消息
-
-        :param data: WebSocket消息数据
-        """
+    async def _parse_ws_message(self, data: bytes, budget: int = MAX_DECODED_BYTES, depth: int = 0) -> int:
         offset = 0
-        try:
+        while offset < len(data):
+            if len(data) - offset < HEADER_STRUCT.size:
+                raise ValueError('Incomplete WebSocket header')
             header = HeaderTuple(*HEADER_STRUCT.unpack_from(data, offset))
-        except struct.error:
-            logger.exception('room=%d parsing header failed, offset=%d, data=%s', self.room_id, offset, data)
-            return
-
-        if header.operation in (Operation.SEND_MSG_REPLY, Operation.AUTH_REPLY):
-            # 业务消息，可能有多个包一起发，需要分包
-            while True:
-                body = data[offset + header.raw_header_size: offset + header.pack_len]
-                await self._parse_business_message(header, body)
-
-                offset += header.pack_len
-                if offset >= len(data):
-                    break
-
-                try:
-                    header = HeaderTuple(*HEADER_STRUCT.unpack_from(data, offset))
-                except struct.error:
-                    logger.exception('room=%d parsing header failed, offset=%d, data=%s', self.room_id, offset, data)
-                    break
-
-        elif header.operation == Operation.HEARTBEAT_REPLY:
-            # 服务器心跳包，前4字节是人气值，后面是客户端发的心跳包内容
-            # pack_len不包括客户端发的心跳包内容，不知道是不是服务器BUG
-            body = data[offset + header.raw_header_size: offset + header.raw_header_size + 4]
-            popularity = int.from_bytes(body, 'big')
-            # 自己造个消息当成业务消息处理
-            body = {
-                'cmd': '_HEARTBEAT',
-                'data': {
-                    'popularity': popularity
-                }
-            }
-            self._handle_command(body)
-
-        else:
-            # 未知消息
-            body = data[offset + header.raw_header_size: offset + header.pack_len]
-            logger.warning('room=%d unknown message operation=%d, header=%s, body=%s', self.room_id,
-                           header.operation, header, body)
-
-    async def _parse_business_message(self, header: HeaderTuple, body: bytes):
-        """
-        解析业务消息
-        """
-        if header.operation == Operation.SEND_MSG_REPLY:
-            # 业务消息
-            if header.ver == ProtoVer.BROTLI:
-                # 压缩过的先解压，为了避免阻塞网络线程，放在其他线程执行
-                body = await asyncio.get_running_loop().run_in_executor(None, brotli.decompress, body)
-                await self._parse_ws_message(body)
-            elif header.ver == ProtoVer.DEFLATE:
-                # web端已经不用zlib压缩了，但是开放平台会用
-                body = await asyncio.get_running_loop().run_in_executor(None, zlib.decompress, body)
-                await self._parse_ws_message(body)
+            if not HEADER_STRUCT.size <= header.raw_header_size <= header.pack_len <= len(data) - offset:
+                raise ValueError('Invalid WebSocket packet length')
+            start = offset + header.raw_header_size
+            offset += header.pack_len
+            if header.operation == Operation.HEARTBEAT_REPLY:
+                # Some heartbeat replies omit echoed client data from their declared length.
+                popularity = int.from_bytes(data[start:start + 4], 'big')
+                self._handle_command({'cmd': '_HEARTBEAT', 'data': {'popularity': popularity}})
+                break
+            body = data[start:offset]
+            if header.operation == Operation.AUTH_REPLY:
+                code = json.loads(body)['code']
+                if code != AuthReplyCode.OK:
+                    raise AuthError(f'auth reply error, code={code}')
+                await self._websocket.send_bytes(self._make_packet({}, Operation.HEARTBEAT))
+            elif header.operation != Operation.SEND_MSG_REPLY:
+                logger.warning('room=%d unknown message operation=%d', self.room_id, header.operation)
+            elif header.ver in (ProtoVer.BROTLI, ProtoVer.DEFLATE):
+                if depth >= MAX_COMPRESSION_DEPTH:
+                    raise ValueError('Too many compressed WebSocket layers')
+                decoded = await asyncio.to_thread(_decode_batch, header.ver, body, budget)
+                budget = await self._parse_ws_message(decoded, budget - len(decoded), depth + 1)
             elif header.ver == ProtoVer.NORMAL:
-                # 没压缩过的直接反序列化，因为有万恶的GIL，这里不能并行避免阻塞
-                if len(body) != 0:
-                    try:
-                        body = json.loads(body.decode('utf-8'))
-                        self._handle_command(body)
-                    except Exception:
-                        logger.error('room=%d, body=%s', self.room_id, body)
-                        raise
+                if body:
+                    self._handle_command(json.loads(body))
             else:
-                # 未知格式
-                logger.warning('room=%d unknown protocol version=%d, header=%s, body=%s', self.room_id,
-                               header.ver, header, body)
-
-        elif header.operation == Operation.AUTH_REPLY:
-            # 认证响应
-            body = json.loads(body.decode('utf-8'))
-            if body['code'] != AuthReplyCode.OK:
-                raise AuthError(f"auth reply error, code={body['code']}, body={body}")
-            await self._websocket.send_bytes(self._make_packet({}, Operation.HEARTBEAT))
-
-        else:
-            # 未知消息
-            logger.warning('room=%d unknown message operation=%d, header=%s, body=%s', self.room_id,
-                           header.operation, header, body)
+                logger.warning('room=%d unknown protocol version=%d', self.room_id, header.ver)
+        return budget
 
     def _handle_command(self, command: dict):
         """
@@ -491,4 +459,4 @@ class WebSocketClientBase:
             # 这里做成同步的，强制用户使用create_task或消息队列处理异步操作，这样就不会阻塞网络协程
             self._handler.handle(self, command)
         except Exception as e:
-            logger.exception('room=%d _handle_command() failed, command=%s', self.room_id, command, exc_info=e)
+            logger.exception('room=%d _handle_command() failed', self.room_id, exc_info=e)

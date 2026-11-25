@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.hot_cache import public_cache
 from app.db.session import get_db_session
 from app.models.music import MusicCatalogRevision, Song, SongPerformance
 from app.schemas.music import MusicListResponse, PerformanceOut, SongDetail, SongSummary, StreamModel
@@ -57,6 +58,7 @@ async def _catalog_revision(response: Response, session: AsyncSession) -> int:
 
 
 @router.get("/music", response_model=MusicListResponse)
+@public_cache("music")
 async def list_music(
     request: Request,
     response: Response,
@@ -166,6 +168,7 @@ async def list_music(
 
 
 @router.get("/music/export")
+@public_cache("music")
 async def export_music(
     response: Response,
     session: AsyncSession = Depends(get_db_session),
@@ -206,6 +209,7 @@ async def export_music(
 
 
 @router.get("/music/{song_id}")
+@public_cache("music")
 async def get_music(
     song_id: str,
     response: Response,

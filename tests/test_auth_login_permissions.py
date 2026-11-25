@@ -14,6 +14,8 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
+from app.core.redis import get_rate_limit_redis
+
 
 class MemoryRedis:
     def __init__(self):
@@ -44,6 +46,7 @@ def login_app(monkeypatch, credential_hashes):
         music_auth_username="test-music", music_auth_password_hash=credential_hashes[1],
         token_ttl_seconds=7200, music_token_ttl_seconds=1800,
     )
+    monkeypatch.setattr("app.core.rate_limit.client_ip", lambda request: "127.0.0.1")
     db = types.ModuleType("app.db.session")
 
     async def offline_db():
@@ -63,7 +66,11 @@ def login_app(monkeypatch, credential_hashes):
     async def offline_redis():
         return redis
 
+    # This fixture exercises credential verification and scopes. Use a separate
+    # in-memory quota dependency; the integration test runs the Lua script on Redis.
+    limits = types.SimpleNamespace(eval=AsyncMock(return_value=0))
     app = FastAPI()
+    app.dependency_overrides[get_rate_limit_redis] = lambda: limits
     app.include_router(auth_api.router)
     app.include_router(music_api.router)
     app.dependency_overrides[auth_api.get_redis_client] = offline_redis

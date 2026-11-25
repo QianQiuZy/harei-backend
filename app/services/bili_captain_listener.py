@@ -7,31 +7,39 @@ import http.cookies
 import json
 import logging
 import random
+import re
 import smtplib
-import threading
+import ssl
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
 
 import aiohttp
-import blivedm
 from aiohttp import ContentTypeError
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
+from sqlalchemy import select
+from sqlalchemy.dialects.mysql import insert
+from sqlalchemy.exc import InterfaceError, OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeout
 
+import blivedm
 from app.core.config import get_settings
 from app.core.redis import get_redis_client
 from app.db.session import async_session_factory
-from sqlalchemy import select
-from sqlalchemy.dialects.mysql import insert
-
 from app.models.captain import Captain
 from app.models.gift_ranking import GiftRanking
 from app.services.captain_reports import save_captains_xlsx
+from app.services.gift_mail import send_gift_message, send_smtp_message
+from app.services.member_gifts import RANK, grant_paid_purchase, record_paid_levels
+from app.services.member_security import accept_dm
 
 logger = logging.getLogger(__name__)
 
@@ -78,17 +86,18 @@ def _send_cookie_invalid_email_async(log_line: str) -> None:
             msg["From"] = settings.email_from
             msg["To"] = settings.email_to
 
-            if int(settings.smtp_port) == 465:
-                with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port) as server:
-                    if settings.smtp_user and settings.smtp_pass:
-                        server.login(settings.smtp_user, settings.smtp_pass)
-                    server.sendmail(settings.email_from, [settings.email_to], msg.as_string())
-            else:
-                with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as server:
-                    server.starttls()
-                    if settings.smtp_user and settings.smtp_pass:
-                        server.login(settings.smtp_user, settings.smtp_pass)
-                    server.sendmail(settings.email_from, [settings.email_to], msg.as_string())
+            use_ssl = int(settings.smtp_port) == 465
+            tls = ssl.create_default_context()
+            connection = (
+                smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=12, context=tls)
+                if use_ssl else smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=12)
+            )
+            with connection as server:
+                if not use_ssl:
+                    server.starttls(context=tls)
+                if settings.smtp_user and settings.smtp_pass:
+                    server.login(settings.smtp_user, settings.smtp_pass)
+                send_smtp_message(server, msg, settings.email_from, [settings.email_to], login=settings.smtp_user)
 
             logger.info("[SMTP] Cookies 失效告警邮件已发送")
         except Exception as e:
@@ -98,7 +107,7 @@ def _send_cookie_invalid_email_async(log_line: str) -> None:
 
 
 def _now() -> datetime.datetime:
-    return datetime.datetime.now()
+    return datetime.datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
 
 
 def month_str(dt: Optional[datetime.datetime] = None) -> str:
@@ -165,9 +174,10 @@ def init_session() -> None:
             continue
         cookies[k] = v
         cookies[k]["domain"] = "bilibili.com"
+        cookies[k]["secure"] = True
 
     global aiohttp_session
-    connector = aiohttp.TCPConnector(ssl=False)
+    connector = aiohttp.TCPConnector()
     aiohttp_session = aiohttp.ClientSession(connector=connector)
     aiohttp_session.cookie_jar.update_cookies(cookies)
 
@@ -343,8 +353,15 @@ class CaptainEvent:
     ship_count: int
     is_red_packet: bool
     joined_at: datetime.datetime
+    room_id: int = 0
+    paid_price: int | None = None
+
+    @property
+    def is_paid(self) -> bool:
+        return self.paid_price is not None and self.paid_price > 0
 
 
+CAPTAIN_ENQUEUE_TASKS: set[asyncio.Task] = set()
 CAPTAIN_QUEUE: "asyncio.Queue[CaptainEvent]" = asyncio.Queue(maxsize=5000)
 
 def _level_name(guard_level: Any) -> Optional[str]:
@@ -438,14 +455,17 @@ def _normalize_guard_rows(raw_list: list[dict[str, Any]]) -> list[dict[str, Any]
 
 
 def _merge_guard_rows(*sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Deduplicate by canonical UID; later sources supply the latest identity."""
+    """Keep each UID's highest tier across the sampled days and its latest nickname."""
     merged: dict[str, dict[str, Any]] = {}
     for source in sources:
         for row in source:
             uid = str(int(row["uid"]))
             if int(uid) <= 0 or row["level"] not in ("舰长", "提督", "总督"):
                 raise GuardSnapshotError("快照包含无效 UID 或等级")
-            merged[uid] = {"uid": uid, "name": str(row["name"]), "level": row["level"]}
+            level = row["level"]
+            if uid in merged and RANK[merged[uid]["level"]] < RANK[level]:
+                level = merged[uid]["level"]
+            merged[uid] = {"uid": uid, "name": str(row["name"]), "level": level}
     return list(merged.values())
 
 
@@ -480,10 +500,12 @@ def _build_guard_report_xlsx(rows: list[dict[str, Any]], month: str) -> Path:
     worksheet.append(headers)
 
     column_widths = [len(header) for header in headers]
-    for row in rows:
+    for row_number, row in enumerate(rows, start=2):
         values = [row.get("uid", ""), row.get("name", ""), row.get("level", "")]
         worksheet.append(values)
         for index, value in enumerate(values):
+            if isinstance(value, str):
+                worksheet.cell(row_number, index + 1).data_type = "s"
             value_length = len(str(value))
             if value_length > column_widths[index]:
                 column_widths[index] = value_length
@@ -517,9 +539,29 @@ def _guard_cache_key(month: str, kind: str) -> str:
     return f"harei:guard-report:{GUARD_REPORT_ROOM_ID}:{month}:{kind}"
 
 
+def _observed_roster_path(month: str, kind: str) -> Path:
+    return GUARD_REPORT_ROOT / ".snapshots" / f"{GUARD_REPORT_ROOM_ID}-{month}-{kind}.json"
+
+
+def _write_observed_roster(path: Path, contents: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as tmp:
+        temp_path = Path(tmp.name)
+    try:
+        temp_path.write_text(contents, encoding="utf-8")
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 async def _load_guard_cache(month: str, kind: str) -> Optional[list[dict[str, Any]]]:
     redis = await get_redis_client()
     raw = await redis.get(_guard_cache_key(month, kind))
+    if raw is None and kind in ("day30", "roster"):
+        try:
+            raw = await asyncio.to_thread(_observed_roster_path(month, kind).read_text, encoding="utf-8")
+        except FileNotFoundError:
+            return None
     if raw is None:
         return None
     data = json.loads(raw)
@@ -534,17 +576,20 @@ async def _save_guard_cache(month: str, kind: str, rows: list[dict[str, Any]],
     redis = await get_redis_client()
     data = {"month": month, "room_id": GUARD_REPORT_ROOM_ID,
             "target_time": target_time.isoformat(), "rows": rows}
-    await redis.set(_guard_cache_key(month, kind), json.dumps(data, ensure_ascii=False),
-                    ex=GUARD_CACHE_TTL)
+    contents = json.dumps(data, ensure_ascii=False)
+    if kind in ("day30", "roster"):
+        # The mailed XLSX also contains late purchases. Retain the actual API roster separately.
+        await asyncio.to_thread(_write_observed_roster, _observed_roster_path(month, kind), contents)
+    await redis.set(_guard_cache_key(month, kind), contents, ex=GUARD_CACHE_TTL)
 
 
 async def _persist_late_guard_event(month: str, field: str, row: dict[str, Any]) -> None:
     try:
         redis = await get_redis_client()
         async with redis.pipeline(transaction=True) as pipe:
-            pipe.hset(_guard_cache_key(month, "late-events"), field,
+            pipe.hset(_guard_cache_key(month, "late-paid-events"), field,
                       json.dumps(row, ensure_ascii=False))
-            pipe.expire(_guard_cache_key(month, "late-events"), GUARD_CACHE_TTL)
+            pipe.expire(_guard_cache_key(month, "late-paid-events"), GUARD_CACHE_TTL)
             await pipe.execute()
     except Exception:
         # Retain the in-process copy; the database event is also written normally.
@@ -553,11 +598,11 @@ async def _persist_late_guard_event(month: str, field: str, row: dict[str, Any])
 
 def _queue_late_guard_event(ev: CaptainEvent, room_id: int) -> None:
     month = month_str(ev.joined_at)
-    if room_id != GUARD_REPORT_ROOM_ID or ev.joined_at < _guard_snapshot_target_for_month(month):
+    if not ev.is_paid or room_id != GUARD_REPORT_ROOM_ID or ev.joined_at < _guard_snapshot_target_for_month(month):
         return
     # Record synchronously before scheduling Redis I/O, so a concurrent fetch
     # cannot miss an event that has already reached the handler.
-    field = f"{ev.joined_at.isoformat()}:{ev.uid}"
+    field = f"{ev.joined_at.isoformat()}:{ev.uid}:{RANK[ev.level]}"
     row = {"uid": ev.uid, "name": ev.username, "level": ev.level}
     GUARD_LATE_EVENTS.setdefault(month, {})[field] = row
     task = asyncio.create_task(_persist_late_guard_event(month, field, row))
@@ -567,7 +612,7 @@ def _queue_late_guard_event(ev: CaptainEvent, room_id: int) -> None:
 
 async def _late_guard_rows(month: str) -> list[dict[str, Any]]:
     redis = await get_redis_client()
-    events = await redis.hgetall(_guard_cache_key(month, "late-events"))
+    events = await redis.hgetall(_guard_cache_key(month, "late-paid-events"))
     records = {field: json.loads(value) for field, value in events.items()}
     records.update(GUARD_LATE_EVENTS.get(month, {}))
     return _merge_guard_rows([records[field] for field in sorted(records)])
@@ -582,6 +627,8 @@ async def _snapshot_guard_report(target_time: datetime.datetime) -> Optional[Pat
         last_day = calendar.monthrange(target_time.year, target_time.month)[1]
         is_preliminary = last_day == 31 and target_time.day == 30
         saved = await _load_guard_cache(month, "day30" if is_preliminary else "final")
+        if not is_preliminary and saved is None:
+            saved = await _load_guard_cache(month, "roster")
         if saved is not None:
             # Restart/retry must not replace an already-complete 23:55 snapshot
             # with a later state where some of those members have expired.
@@ -604,7 +651,9 @@ async def _snapshot_guard_report(target_time: datetime.datetime) -> Optional[Pat
             await _save_guard_cache(month, "day30", rows, target_time)
             logger.info("[Guard] 30 号快照已存入 Redis month=%s count=%s", month, len(rows))
             return None
-        rows = _merge_guard_rows(prior_rows, rows, await _late_guard_rows(month))
+        roster = _merge_guard_rows(prior_rows, rows)
+        await _save_guard_cache(month, "roster", roster, target_time)
+        rows = _merge_guard_rows(roster, await _late_guard_rows(month))
         await _save_guard_cache(month, "final", rows, target_time)
         path = await asyncio.to_thread(_build_guard_report_xlsx, rows, month)
         logger.info("[Guard] 在舰列表快照已生成 month=%s count=%s path=%s", month, len(rows), path)
@@ -646,8 +695,8 @@ def _send_guard_report_email(
     captain_total: int,
 ) -> None:
     settings = get_settings()
-    if not (settings.smtp_host and settings.email_from):
-        raise GuardSnapshotError("未配置 SMTP_HOST/EMAIL_FROM，月度舰长邮件未发送")
+    if not (settings.gift_smtp_host and settings.gift_email_from):
+        raise GuardSnapshotError("未配置舰礼发信服务，月度舰长邮件未发送")
 
     cc_list = settings.email_cc_list
 
@@ -660,7 +709,6 @@ def _send_guard_report_email(
 
     msg = MIMEMultipart()
     msg["Subject"] = subject
-    msg["From"] = settings.email_from
     msg["To"] = GUARD_REPORT_RECEIVER
     if cc_list:
         msg["Cc"] = ",".join(cc_list)
@@ -675,23 +723,11 @@ def _send_guard_report_email(
         attachment.add_header("Content-Disposition", "attachment", filename=file_path.name)
         msg.attach(attachment)
 
-    receivers = [GUARD_REPORT_RECEIVER, *cc_list]
-
-    if int(settings.smtp_port) == 465:
-        with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port) as server:
-            if settings.smtp_user and settings.smtp_pass:
-                server.login(settings.smtp_user, settings.smtp_pass)
-            server.sendmail(settings.email_from, receivers, msg.as_string())
-    else:
-        with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as server:
-            server.starttls()
-            if settings.smtp_user and settings.smtp_pass:
-                server.login(settings.smtp_user, settings.smtp_pass)
-            server.sendmail(settings.email_from, receivers, msg.as_string())
+    send_gift_message(settings, msg, [GUARD_REPORT_RECEIVER, *cc_list])
 
 
 async def _run_guard_report(target_time: datetime.datetime) -> None:
-    await CAPTAIN_QUEUE.join()
+    await drain_captain_queue()
     if GUARD_EVENT_TASKS:
         await asyncio.gather(*list(GUARD_EVENT_TASKS))
     month = _report_month_for_target(target_time)
@@ -776,32 +812,69 @@ async def guard_report_scheduler() -> None:
         await asyncio.gather(snapshot_task, email_task, return_exceptions=True)
 
 
-async def captain_writer_worker() -> None:
-    while True:
-        ev = await CAPTAIN_QUEUE.get()
-        try:
-            async with async_session_factory() as session:
-                row = Captain(
+async def record_paid_level(db, ev):
+    await record_paid_levels(db, month_str(ev.joined_at), [(ev.uid, RANK[ev.level], ev.username)])
+
+
+async def write_captain_event(ev):
+    paid = ev.room_id == GUARD_REPORT_ROOM_ID and ev.is_paid
+    try:
+        async with async_session_factory.begin() as db:
+            db.add(
+                Captain(
                     user_uid=ev.uid,
                     username=ev.username,
                     joined_at=ev.joined_at,
                     joined_month=month_str(ev.joined_at),
                     level=ev.level,
                     ship_count=int(ev.ship_count or 1),
-                    is_red_packet=bool(ev.is_red_packet),
+                    is_red_packet=ev.is_red_packet,
+                    room_id=ev.room_id,
+                    paid_price=ev.paid_price,
                 )
-                session.add(row)
-                await session.commit()
-        except Exception as e:
-            logger.error("[Captain] 写入失败 uid=%s level=%s: %s", ev.uid, ev.level, e)
+            )
+            if paid:
+                await record_paid_level(db, ev)
+    except (OperationalError, InterfaceError, PoolTimeout):
+        if not paid:
+            raise
+        # A disconnect during commit has an unknown outcome. Replay only the idempotent evidence.
+        delay = 1
+        while True:
+            logger.warning("[Captain] 上舰付费记录待重试 uid=%s", ev.uid)
+            await asyncio.sleep(delay)
             try:
-                await session.rollback()
-            except Exception:
-                pass
+                async with async_session_factory.begin() as db:
+                    await record_paid_level(db, ev)
+                break
+            except (OperationalError, InterfaceError, PoolTimeout):
+                delay = min(30, delay * 2)
+    if paid:
+        # A cache/fulfillment failure cannot roll back the confirmed payment. The gift worker retries it.
+        async with async_session_factory.begin() as db:
+            await grant_paid_purchase(db, month_str(ev.joined_at), ev.uid)
+
+
+async def captain_writer_worker() -> None:
+    while True:
+        ev = await CAPTAIN_QUEUE.get()
+        try:
+            await write_captain_event(ev)
+        except Exception:
+            logger.exception("[Captain] 写入或资格同步失败 uid=%s", ev.uid)
         finally:
             CAPTAIN_QUEUE.task_done()
 
+
+async def drain_captain_queue():
+    if CAPTAIN_ENQUEUE_TASKS:
+        await asyncio.gather(*list(CAPTAIN_ENQUEUE_TASKS))
+    await CAPTAIN_QUEUE.join()
+
 async def _start_client(room_id: int) -> None:
+    global _last_sender_valid, _last_heartbeat
+    if room_id == GUARD_REPORT_ROOM_ID:
+        _last_sender_valid, _last_heartbeat = None, 0.0
     client = blivedm.BLiveClient(room_id, session=aiohttp_session)
     client.set_handler(MyHandler())
     client.start()
@@ -861,9 +934,48 @@ async def reconnect_scheduler() -> None:
         logger.info("[reconnect] 本日全量重连任务完成")
 
 
+_last_heartbeat = 0.0
+_last_sender_valid: bool | None = None
+_dm_tasks: set[asyncio.Task] = set()
+
+
+def verification_listener_status() -> str:
+    client = ROOM_CLIENTS.get(GUARD_REPORT_ROOM_ID)
+    if not client or not client.is_running:
+        return "offline"
+    if time.monotonic() - _last_heartbeat > 75:
+        return "connecting"
+    if _last_sender_valid is False or not get_settings().bili_sessdata:
+        return "uid_unavailable"
+    if _last_sender_valid is None:
+        return "awaiting_danmaku"
+    return "online"
+
+
+async def _match_verification(uid: str, username: str, message: str):
+    try:
+        await accept_dm(await get_redis_client(), GUARD_REPORT_ROOM_ID, uid, username, message)
+    except Exception as exc:
+        logger.warning("弹幕验证暂不可用 (%s)", type(exc).__name__)
+
+
 class MyHandler(blivedm.BaseHandler):
+    def _on_danmaku(self, client, message):
+        global _last_sender_valid, _last_heartbeat
+        if client.room_id != GUARD_REPORT_ROOM_ID or message.is_mirror or message.dm_type != 0:
+            return
+        uid = str(message.uid or "")
+        _last_heartbeat = time.monotonic()
+        _last_sender_valid = bool(re.fullmatch(r"[1-9][0-9]{0,19}", uid))
+        if _last_sender_valid and re.fullmatch(r"[A-Z0-9]{6}", message.msg) and len(_dm_tasks) < 128:
+            task = asyncio.create_task(_match_verification(uid, message.uname or "", message.msg))
+            _dm_tasks.add(task)
+            task.add_done_callback(_dm_tasks.discard)
+
     def _on_heartbeat(self, client: blivedm.BLiveClient, message: Any) -> None:  # noqa: N802
-        return
+        global _last_heartbeat
+        if client.room_id == GUARD_REPORT_ROOM_ID:
+            _last_heartbeat = time.monotonic()
 
     def _on_gift(self, client: blivedm.BLiveClient, message: Any) -> None:  # noqa: N802
         try:
@@ -909,19 +1021,20 @@ class MyHandler(blivedm.BaseHandler):
                 return
 
             num = getattr(message, "num", 1) or 1
-            price = getattr(message, "price", 0)
-            try:
-                is_red_packet = int(price) == 1900
-            except Exception:
-                is_red_packet = False
+            # USER_TOAST_MSG_V2.pay_info.price is the transaction price in gold seeds.
+            # A blind-box award can contain days and a gift with a face value while costing zero.
+            raw_price = getattr(message, "price", None)
+            price = int(raw_price) if re.fullmatch(r"[0-9]{1,18}", str(raw_price)) else None
 
             ev = CaptainEvent(
                 uid=str(uid),
                 username=str(username),
                 level=level,
                 ship_count=int(num),
-                is_red_packet=is_red_packet,
+                is_red_packet=price == 1900,
+                paid_price=price,
                 joined_at=_now(),
+                room_id=client.room_id,
             )
 
             _queue_late_guard_event(ev, client.room_id)
@@ -929,7 +1042,12 @@ class MyHandler(blivedm.BaseHandler):
             try:
                 CAPTAIN_QUEUE.put_nowait(ev)
             except asyncio.QueueFull:
-                logger.warning("[Captain] 队列已满，丢弃 uid=%s room_id=%s", ev.uid, client.room_id)
+                if ev.is_paid and ev.room_id == GUARD_REPORT_ROOM_ID:
+                    task = asyncio.create_task(CAPTAIN_QUEUE.put(ev))
+                    CAPTAIN_ENQUEUE_TASKS.add(task)
+                    task.add_done_callback(CAPTAIN_ENQUEUE_TASKS.discard)
+                else:
+                    logger.warning("[Captain] 记录队列已满 uid=%s room_id=%s", ev.uid, client.room_id)
         except Exception as e:
             logger.error("[Captain] 处理 USER_TOAST_V2 异常: %s", e)
 
@@ -997,11 +1115,12 @@ async def bootstrap() -> None:
 
 async def shutdown() -> None:
     tasks = list(_tasks)
-    for t in tasks:
-        t.cancel()
+    writer = next((t for t in tasks if t.get_name() == "bili:cpt_writer"), None)
+    producers = [t for t in tasks if t is not writer]
+    for task in producers:
+        task.cancel()
     _tasks.clear()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.gather(*producers, return_exceptions=True)
 
     # 关闭客户端
     for rid, client in list(ROOM_CLIENTS.items()):
@@ -1010,6 +1129,16 @@ async def shutdown() -> None:
         except Exception:
             pass
     ROOM_CLIENTS.clear()
+    if writer:
+        try:
+            await asyncio.wait_for(drain_captain_queue(), timeout=12)
+        except TimeoutError:
+            logger.warning("[Captain] 关闭时写入队列仍有待处理事件")
+        finally:
+            writer.cancel()
+            await asyncio.gather(writer, return_exceptions=True)
+    if _dm_tasks:
+        await asyncio.gather(*list(_dm_tasks), return_exceptions=True)
     if GUARD_EVENT_TASKS:
         await asyncio.gather(*list(GUARD_EVENT_TASKS))
 

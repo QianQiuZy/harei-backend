@@ -27,11 +27,15 @@ def gift_client(monkeypatch, tmp_path):
         monkeypatch.setenv(key, value)
     api = import_module("app.api.captaingift")
 
+    rows = []
     result = Mock()
-    result.scalar_one_or_none.return_value = None
+    result.scalars.return_value.all.side_effect = lambda: list(rows)
     db = Mock()
     db.execute = AsyncMock(return_value=result)
-    db.add.side_effect = lambda row: setattr(result.scalar_one_or_none, "return_value", row)
+    db.scalars = AsyncMock(side_effect=lambda _: [row.image_path for row in rows])
+    monkeypatch.setattr(api, "public_fence", AsyncMock())
+    db.add.side_effect = rows.append
+    db.delete = AsyncMock(side_effect=rows.remove)
     db.commit = AsyncMock()
 
     async def offline_db():
@@ -45,7 +49,7 @@ def gift_client(monkeypatch, tmp_path):
     app.dependency_overrides[api.get_db_session] = offline_db
     app.dependency_overrides[api.require_token] = offline_admin
     with TestClient(app) as client:
-        yield client, result.scalar_one_or_none
+        yield client, rows
 
 
 def _upload(client, color):
@@ -61,30 +65,48 @@ def _upload(client, color):
 
 
 def test_reuploading_identical_captaingift_keeps_image_downloadable(gift_client):
-    client, get_record = gift_client
+    client, rows = gift_client
     _upload(client, "red")
-    path = get_record().image_path
+    path = rows[0].image_path
     assert not Path(path).is_absolute()
     original = client.get("/captaingift/image", params={"path": path})
     assert original.status_code == 200
 
     _upload(client, "red")
 
-    assert get_record().image_path == path
+    assert rows[0].image_path == path
     repeated = client.get("/captaingift/image", params={"path": path})
     assert repeated.status_code == 200
     assert repeated.content == original.content
 
 
 def test_uploading_different_captaingift_removes_old_image(gift_client):
-    client, get_record = gift_client
+    client, rows = gift_client
     _upload(client, "red")
-    old_path = get_record().image_path
+    old_path = rows[0].image_path
     assert Path(old_path).is_file()
 
     _upload(client, "blue")
 
-    new_path = get_record().image_path
+    new_path = rows[0].image_path
     assert new_path != old_path
     assert not Path(old_path).exists()
     assert client.get("/captaingift/image", params={"path": new_path}).status_code == 200
+
+
+def test_legacy_duplicate_month_can_be_replaced_and_deleted(gift_client):
+    from app.models.captain_gift_archive import CaptainGiftArchive
+
+    client, rows = gift_client
+    _upload(client, "red")
+    first = Path(rows[0].image_path)
+    second = first.with_name("202610.jpg")
+    second.write_bytes(first.read_bytes())
+    rows.append(CaptainGiftArchive(gift_month="202610", image_path=str(second)))
+
+    _upload(client, "blue")
+    current = Path(rows[0].image_path)
+    assert current.is_file() and {row.image_path for row in rows} == {str(current)}
+    assert not first.exists() and not second.exists()
+    assert client.post("/captaingift/delete", json={"month": "202610"}).status_code == 200
+    assert not rows and not current.exists()

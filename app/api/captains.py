@@ -1,4 +1,5 @@
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from io import BytesIO
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -31,7 +32,7 @@ async def list_captains(
     session: AsyncSession = Depends(get_db_session),
     _: None = Depends(require_token),
 ) -> CaptainListResponse:
-    current_month = datetime.utcnow().strftime("%Y%m")
+    current_month = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m")
     target_month = month or current_month
 
     query = select(Captain)

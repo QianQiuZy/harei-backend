@@ -1,0 +1,10 @@
+FROM python:3.13-slim-bookworm
+WORKDIR /srv/harei
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 TZ=Asia/Shanghai
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app app
+COPY blivedm blivedm
+COPY emoji_assets emoji_assets
+RUN mkdir -p uploads/captaingift uploads/jpg uploads/original uploads/thumbs download_files
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "6555", "--workers", "1", "--no-proxy-headers"]

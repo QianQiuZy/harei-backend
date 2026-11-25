@@ -1,44 +1,62 @@
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
-import anyio
-from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import URL
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
+from app.services.hot_cache import TrackedSession, prepare_commit, publish
 
 settings = get_settings()
-
-DATABASE_URL = (
-    "mysql+asyncmy://"
-    f"{settings.mysql_user}:{settings.mysql_password}"
-    f"@{settings.mysql_host}:{settings.mysql_port}/{settings.mysql_database}"
-    "?charset=utf8mb4"
+DATABASE_URL = URL.create(
+    "mysql+asyncmy",
+    username=settings.mysql_user,
+    password=settings.mysql_password,
+    host=settings.mysql_host,
+    port=settings.mysql_port,
+    database=settings.mysql_database,
+    query={"charset": "utf8mb4"},
+)
+engine = create_async_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    hide_parameters=True,
+    isolation_level="READ COMMITTED",
+    pool_size=settings.mysql_pool_size,
+    max_overflow=settings.mysql_max_overflow,
+    pool_timeout=settings.mysql_pool_timeout,
+    pool_recycle=settings.mysql_pool_recycle,
 )
 
-engine: AsyncEngine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
-async_session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-MAX_DB_CONNECT_RETRIES = 3
-DB_CONNECT_RETRY_BACKOFF_SECONDS = 0.5
+class ApplicationSession(AsyncSession):
+    sync_session_class = TrackedSession
+
+    async def commit(self):
+        pending = await prepare_commit(self)
+        await super().commit()
+        self.info.pop("hot_changes", None)
+        await publish(pending)
+
+
+class SessionFactory(async_sessionmaker):
+    @asynccontextmanager
+    async def begin(self):
+        async with self() as db:
+            try:
+                yield db
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+
+
+async_session_factory = SessionFactory(
+    engine, class_=ApplicationSession, expire_on_commit=False
+)
+
 
 async def get_db_session() -> AsyncGenerator[AsyncSession]:
-    for attempt in range(1, MAX_DB_CONNECT_RETRIES + 1):
-        session = async_session_factory()
-        try:
-            try:
-                _ = await session.execute(text("SELECT 1"))
-            except DBAPIError:
-                if attempt >= MAX_DB_CONNECT_RETRIES:
-                    raise
-            else:
-                try:
-                    yield session
-                finally:
-                    if session.in_transaction():
-                        await session.rollback()
-                return
-        finally:
-            await session.close()
-        await engine.dispose()
-        await anyio.sleep(DB_CONNECT_RETRY_BACKOFF_SECONDS * attempt)
+    # Constructing a session is lazy. Hot reads never check out a MySQL connection.
+    async with async_session_factory() as session:
+        yield session

@@ -1,3 +1,4 @@
+from app.models import member_gifts
 from app.models.captain_gift_archive import CaptainGiftArchive
 from app.models.captain import Captain
 from app.models.gift_ranking import GiftRanking

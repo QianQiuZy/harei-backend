@@ -1,0 +1,11 @@
+**
+!Dockerfile.local
+!requirements.txt
+!app/
+!app/**
+!blivedm/
+!blivedm/**
+!emoji_assets/
+!emoji_assets/**
+**/__pycache__/
+**/*.pyc

@@ -4,6 +4,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.redis import get_redis_client
+from app.services.hot_cache import public_cache
 from app.db.session import get_db_session
 from app.deps.auth import require_admin
 from app.models.tag import Tag
@@ -20,6 +21,7 @@ async def require_token(
 
 
 @router.get("/active", response_model=TagNameResponse)
+@public_cache("tags")
 async def list_active(session: AsyncSession = Depends(get_db_session)) -> TagNameResponse:
     result = await session.execute(select(Tag).where(Tag.status == "approved"))
     rows = result.scalars().all()

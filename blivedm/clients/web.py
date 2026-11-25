@@ -217,7 +217,7 @@ class BLiveClient(ws_base.WebSocketClientBase):
         if self._uid is None:
             if not await self._init_uid():
                 logger.warning('room=%d _init_uid() failed', self._tmp_room_id)
-                self._uid = 0
+                return False
 
         if self._get_buvid() == '':
             if not await self._init_buvid():
