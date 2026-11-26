@@ -219,6 +219,8 @@ async def workflow():
             return match[1]
 
         async def check_code_reservations():
+            with patch.object(security.secrets, "randbelow", return_value=1234):
+                assert security.random_dm_code() == "00001234"
             first = await security.new_flow(
                 redis, kind="register", owner="", identity=prefix + "1"
             )
@@ -267,6 +269,20 @@ async def workflow():
             assert 0 < await redis.ttl(security.dm_key(codes[0])) <= 600
             assert await security.accept_dm(redis, ROOM, bob, "乙", rotated)
             assert (await security.dm_status(redis, first))["uid"] == bob
+            status_path = "/user-auth/verification-status"
+            plain_headers = {"Content-Type": "text/plain; charset=UTF-8"}
+            async with httpx.AsyncClient(transport=transport, base_url="http://localhost:6555") as plain:
+                response = await plain.post(status_path, content=first, headers={
+                    **plain_headers, "Origin": "http://localhost:3000"
+                })
+                assert response.status_code == 200 and response.json()["uid"] == bob
+                assert response.headers["cache-control"] == "private, no-store"
+                for origin in (None, "https://invalid.test"):
+                    headers = plain_headers | ({"Origin": origin} if origin else {})
+                    assert (await plain.post(status_path, content=first, headers=headers)).status_code == 403
+                allowed_plain = plain_headers | {"Origin": "http://localhost:3000"}
+                assert (await plain.post(status_path, content="bad", headers=allowed_plain)).status_code == 422
+                assert (await plain.post("/user-auth/uid-challenge", content=first, headers=allowed_plain)).status_code == 403
             # Once an expired code is reallocated, the old pending page must still show it as expired.
             await redis.delete(security.dm_key(codes[1]))
             third = await security.new_flow(
@@ -277,11 +293,25 @@ async def workflow():
             expired = await security.dm_status(redis, second)
             assert expired["code"] is None and expired["expires_in"] == 0
 
+            legacy = await security.new_flow(
+                redis, kind="register", owner="", identity=prefix + "legacy"
+            )
+            legacy_key = security.flow_key(legacy)
+            old_code = "A1B2C3"
+            proof_key = security.dm_key(old_code)
+            await redis.set(proof_key, legacy_key, ex=600)
+            await redis.hset(legacy_key, mapping={"code": old_code, "proof": proof_key, "verified": "0"})
+            assert (await security.dm_status(redis, legacy))["code"] is None
+            assert not await security.accept_dm(redis, ROOM, alice, "甲", old_code)
+            await redis.hset(legacy_key, mapping={"verified": "1", "uid": alice})
+            assert (await security.verified_flow(redis, legacy, "register", "", alice))["code"] == old_code
+
         await check_code_reservations()
 
         async def proof(c, flow, uid):
             info = await req(c, "POST", "/user-auth/uid-challenge", {"flow": flow})
-            assert info["uid"] is None and info["username"] is None and info["code"]
+            assert info["uid"] is None and info["username"] is None
+            assert re.fullmatch(r"[0-9]{8}", info["code"])
             assert info["expires_in"] == 600 and 59 <= info["retry_after"] <= 60
             again = await c.post("/user-auth/uid-challenge", json={"flow": flow})
             assert (

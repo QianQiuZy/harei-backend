@@ -39,7 +39,7 @@ from app.models.gift_ranking import GiftRanking
 from app.services.captain_reports import save_captains_xlsx
 from app.services.gift_mail import send_gift_message, send_smtp_message
 from app.services.member_gifts import RANK, grant_paid_purchase, record_paid_levels
-from app.services.member_security import accept_dm
+from app.services.member_security import DM_CODE_PATTERN, accept_dm
 
 logger = logging.getLogger(__name__)
 
@@ -967,7 +967,7 @@ class MyHandler(blivedm.BaseHandler):
         uid = str(message.uid or "")
         _last_heartbeat = time.monotonic()
         _last_sender_valid = bool(re.fullmatch(r"[1-9][0-9]{0,19}", uid))
-        if _last_sender_valid and re.fullmatch(r"[A-Z0-9]{6}", message.msg) and len(_dm_tasks) < 128:
+        if _last_sender_valid and DM_CODE_PATTERN.fullmatch(message.msg) and len(_dm_tasks) < 128:
             task = asyncio.create_task(_match_verification(uid, message.uname or "", message.msg))
             _dm_tasks.add(task)
             task.add_done_callback(_dm_tasks.discard)

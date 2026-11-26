@@ -1,6 +1,7 @@
 import secrets
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from sqlalchemy import func, select, update
 
 from app.core.rate_limit import client_ip
@@ -87,12 +88,12 @@ async def listener_status():
     return {"room": sec.ROOM, "listener": verification_listener_status()}
 
 
-@router.post("/user-auth/verification-status")
-async def verification_status(body: form.Flow, redis: RedisDB):
+@router.post(sec.VERIFICATION_STATUS_PATH)
+async def verification_status(body: Annotated[form.Flow | form.Token, Body()], redis: RedisDB):
     from app.services.bili_captain_listener import verification_listener_status
 
     return {
-        **await sec.dm_status(redis, body.flow),
+        **await sec.dm_status(redis, body if isinstance(body, str) else body.flow),
         "room": sec.ROOM,
         "listener": verification_listener_status(),
     }

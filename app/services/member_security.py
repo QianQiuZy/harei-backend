@@ -5,7 +5,6 @@ import hmac
 import json
 import re
 import secrets
-import string
 from email.message import EmailMessage
 from typing import Literal
 
@@ -22,6 +21,9 @@ from app.services.gift_mail import send_gift_message
 
 ROOM = 1820703922
 CODE_TTL = 600
+DM_CODE_LENGTH = 8
+DM_CODE_PATTERN = re.compile(rf"[0-9]{{{DM_CODE_LENGTH}}}")
+VERIFICATION_STATUS_PATH = "/user-auth/verification-status"
 RESEND_SECONDS = 60
 DAILY_EMAIL_LIMIT = 10
 FLOW_TTL = 1800
@@ -112,6 +114,13 @@ def require_origin(request: Request):
         return
     origin = request.headers.get("origin")
     allowed = get_settings().cors_allow_origins_list
+    if (
+        request.method == "POST"
+        and request.url.path == VERIFICATION_STATUS_PATH
+        and origin in allowed
+        and request.headers.get("content-type", "").split(";", 1)[0].strip().lower() == "text/plain"
+    ):
+        return
     if request.headers.get("x-harei-request") != "1" or (
         origin and origin not in allowed
     ):
@@ -293,11 +302,7 @@ async def new_flow(redis: Redis, **fields: str) -> str:
 
 
 def random_dm_code() -> str:
-    alphabet = string.ascii_uppercase + string.digits
-    while True:
-        code = "".join(secrets.choice(alphabet) for _ in range(6))
-        if any(c.isalpha() for c in code) and any(c.isdigit() for c in code):
-            return code
+    return str(secrets.randbelow(10 ** DM_CODE_LENGTH)).zfill(DM_CODE_LENGTH)
 
 
 def dm_key(code: str) -> str:
@@ -367,6 +372,8 @@ async def dm_status(redis: Redis, token: str) -> dict:
         raise HTTPException(410, "验证流程已过期")
     code, matched, uid, username, ttl_ms, kind, identity = result
     verified = bool(code and matched == "1")
+    if not verified and not DM_CODE_PATTERN.fullmatch(code):
+        ttl_ms = 0
     remaining = max(0, await redis.pttl(resend_key(kind, identity)))
     return {
         "issued": bool(code),
@@ -383,7 +390,7 @@ async def accept_dm(redis: Redis, room: int, uid: str, username: str, message: s
     if (
         room != ROOM
         or not re.fullmatch(r"[1-9][0-9]{0,19}", uid)
-        or not re.fullmatch(r"[A-Z0-9]{6}", message)
+        or not DM_CODE_PATTERN.fullmatch(message)
     ):
         return False
     # Keep the public code reserved until its original expiry, including after a match or rotation.
